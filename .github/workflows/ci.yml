@@ -24,13 +24,13 @@ jobs:
           dotnet-version: '8.0.x'
 
       - name: Restore
-        run: dotnet restore Dragonfire.Caching.sln
+        run: dotnet restore Dragonfire.Logging.slnx
 
       - name: Build
-        run: dotnet build Dragonfire.Caching.sln --configuration Release --no-restore
+        run: dotnet build Dragonfire.Logging.slnx--configuration Release --no-restore
 
       - name: Pack (smoke-test — not published)
-        run: dotnet pack Dragonfire.Caching.sln --configuration Release --no-build --output ./nupkgs
+        run: dotnet pack Dragonfire.Logging.slnx --configuration Release --no-build --output ./nupkgs
 
       - name: Upload packages as artifact
         uses: actions/upload-artifact@v4
