@@ -10,9 +10,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Package version (e.g. 3.0.1)'
+        description: 'Package version (e.g. 8.0.1)'
         required: true
-        default: '3.0.0'
+        default: '8.0.0'
 
 env:
   DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
@@ -48,11 +48,11 @@ jobs:
 
       # ── Build ─────────────────────────────────────────────────────────────
       - name: Restore
-        run: dotnet restore Dragonfire.Caching.sln
+        run: dotnet restore Dragonfire.Logging.slnx
 
       - name: Build
         run: |
-          dotnet build Dragonfire.Caching.sln \
+          dotnet build Dragonfire.Logging.slnx \
             --configuration Release \
             --no-restore \
             -p:Version=${{ steps.version.outputs.value }}
@@ -60,7 +60,7 @@ jobs:
       # ── Pack ──────────────────────────────────────────────────────────────
       - name: Pack
         run: |
-          dotnet pack Dragonfire.Caching.sln \
+          dotnet pack Dragonfire.Logging.slnx \
             --configuration Release \
             --no-build \
             --output ./nupkgs \
