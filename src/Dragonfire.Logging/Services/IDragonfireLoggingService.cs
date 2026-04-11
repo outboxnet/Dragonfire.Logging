@@ -11,7 +11,13 @@ namespace Dragonfire.Logging.Services
     /// </summary>
     public interface IDragonfireLoggingService
     {
-        /// <summary>Persist a fully-built log entry.</summary>
+        /// <summary>
+        /// Synchronous write — used by the proxy for intercepted synchronous methods
+        /// so the call never blocks on an async continuation.
+        /// </summary>
+        void Log(LogEntry entry);
+
+        /// <summary>Persist a fully-built log entry asynchronously.</summary>
         Task LogAsync(LogEntry entry);
 
         /// <summary>

@@ -10,7 +10,8 @@
       "Bash(cp Services/IDragonfireLoggingService.cs Services/DragonfireLoggingService.cs Services/ILogFilterService.cs Services/LogFilterService.cs src/Dragonfire.Logging/Services/)",
       "Bash(dotnet new:*)",
       "Bash(dotnet sln:*)",
-      "Bash(ls \"D:/Dragonfire.Logging/\"*.sln)"
+      "Bash(ls \"D:/Dragonfire.Logging/\"*.sln)",
+      "Bash(dotnet list:*)"
     ]
   }
 }

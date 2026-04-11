@@ -1,6 +1,5 @@
 using System;
 using System.Linq;
-using Castle.DynamicProxy;
 using Dragonfire.Logging.Abstractions;
 using Dragonfire.Logging.Configuration;
 using Dragonfire.Logging.Interceptors;
@@ -13,16 +12,18 @@ namespace Dragonfire.Logging.Extensions
     public static class DragonfireLoggingExtensions
     {
         /// <summary>
-        /// Registers Dragonfire.Logging core services:
+        /// Registers the Dragonfire.Logging core services:
         /// <list type="bullet">
-        ///   <item><see cref="IDragonfireLoggingService"/> — structured log writer with correlation-ID context.</item>
+        ///   <item><see cref="IDragonfireLoggingService"/> — structured log writer with per-request correlation context.</item>
         ///   <item><see cref="ILogFilterService"/> — payload sanitiser and sensitive-data redactor.</item>
-        ///   <item>Castle <see cref="ProxyGenerator"/> (singleton).</item>
-        ///   <item><see cref="DragonfireInterceptor"/> (transient) — service-layer proxy.</item>
         /// </list>
+        /// No external packages are required — service decoration uses the built-in
+        /// <see cref="System.Reflection.DispatchProxy"/> and a minimal hand-rolled
+        /// Decorate helper; zero Castle / Scrutor dependencies.
+        ///
         /// When <see cref="DragonfireLoggingOptions.EnableServiceInterception"/> is <c>true</c>,
-        /// all services registered <b>before</b> this call whose implementation implements
-        /// <see cref="ILoggable"/> are automatically decorated via Scrutor.
+        /// every service registered <b>before</b> this call whose implementation implements
+        /// <see cref="ILoggable"/> is automatically wrapped with a logging proxy.
         ///
         /// For HTTP request/response logging also call
         /// <c>AddDragonfireAspNetCore()</c> from the <c>Dragonfire.Logging.AspNetCore</c> package.
@@ -37,9 +38,6 @@ namespace Dragonfire.Logging.Extensions
             services.AddSingleton(options);
             services.AddSingleton(options.SensitiveDataPolicy);
 
-            // ProxyGenerator compiles IL to build proxy types — must be singleton.
-            services.TryAddSingleton<ProxyGenerator>();
-
             services.TryAdd(ServiceDescriptor.Describe(
                 typeof(IDragonfireLoggingService),
                 typeof(DragonfireLoggingService),
@@ -48,9 +46,6 @@ namespace Dragonfire.Logging.Extensions
             // LogFilterService is stateless — singleton avoids repeated allocation.
             services.TryAddSingleton<ILogFilterService, LogFilterService>();
 
-            // Interceptor is Transient so it safely consumes Scoped services per request.
-            services.TryAddTransient<DragonfireInterceptor>();
-
             if (options.EnableServiceInterception)
                 services.DecorateLoggableServices();
 
@@ -58,13 +53,17 @@ namespace Dragonfire.Logging.Extensions
         }
 
         /// <summary>
-        /// Decorates every already-registered interface service whose concrete
-        /// implementation implements <see cref="ILoggable"/> with a Castle DynamicProxy
-        /// that transparently logs all method calls.
+        /// Wraps every already-registered interface service whose concrete implementation
+        /// implements <see cref="ILoggable"/> with a <see cref="System.Reflection.DispatchProxy"/>
+        /// that transparently logs every method call — arguments, return value, elapsed time,
+        /// and exceptions — without touching the service's own code.
         ///
-        /// Called automatically by <see cref="AddDragonfireLogging"/> when
-        /// <see cref="DragonfireLoggingOptions.EnableServiceInterception"/> is <c>true</c>,
-        /// or invoke it directly for manual control.
+        /// <b>Call this after all service registrations</b>, or use
+        /// <see cref="DragonfireLoggingOptions.EnableServiceInterception"/> = <c>true</c>
+        /// which calls it automatically inside <see cref="AddDragonfireLogging"/>.
+        ///
+        /// Only interface registrations are proxied; class-only registrations are skipped
+        /// because <see cref="System.Reflection.DispatchProxy"/> requires an interface target.
         /// </summary>
         public static IServiceCollection DecorateLoggableServices(this IServiceCollection services)
         {
@@ -79,15 +78,10 @@ namespace Dragonfire.Logging.Extensions
 
             foreach (var serviceType in targets)
             {
-                // Scrutor's Decorate keeps the original implementation as "inner";
-                // the proxy delegates every call to it after logging.
+                // Uses the hand-rolled Decorate from ServiceDecorationExtensions
+                // (same assembly, internal) — no Scrutor required.
                 services.Decorate(serviceType, (inner, provider) =>
-                {
-                    var generator   = provider.GetRequiredService<ProxyGenerator>();
-                    var interceptor = provider.GetRequiredService<DragonfireInterceptor>();
-                    return generator.CreateInterfaceProxyWithTarget(
-                        serviceType, inner, interceptor.ToInterceptor());
-                });
+                    DragonfireProxyFactory.Create(serviceType, inner, provider));
             }
 
             return services;
@@ -96,10 +90,9 @@ namespace Dragonfire.Logging.Extensions
         // ── IDragonfireLoggingService fluent helpers ──────────────────────────
 
         /// <summary>
-        /// Attach a user identity to the ambient logging context for
-        /// <paramref name="correlationId"/> so every subsequent
-        /// <see cref="Models.LogEntry"/> in this scope carries <c>UserId</c>.
-        /// Returns the service for fluent chaining.
+        /// Attach a user identity to the ambient logging context so every subsequent
+        /// <see cref="Models.LogEntry"/> produced within the same scope carries
+        /// <c>UserId</c>.  Returns the service for fluent chaining.
         /// </summary>
         public static IDragonfireLoggingService WithCorrelationId(
             this IDragonfireLoggingService service,

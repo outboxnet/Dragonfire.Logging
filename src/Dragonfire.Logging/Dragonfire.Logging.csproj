@@ -17,13 +17,12 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- No FrameworkReference — core is ASP.NET-free -->
-    <PackageReference Include="Castle.Core"                                   Version="5.1.1" />
-    <PackageReference Include="Castle.Core.AsyncInterceptor"                  Version="2.1.0" />
-    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions"     Version="8.0.2" />
+    <!-- No FrameworkReference — core is ASP.NET-free.
+         No Castle.Core / Castle.Core.AsyncInterceptor / Scrutor — decoration uses
+         the built-in System.Reflection.DispatchProxy with a hand-rolled Decorate helper. -->
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions"            Version="8.0.2" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="8.0.2" />
-    <PackageReference Include="Newtonsoft.Json"                               Version="13.0.3" />
-    <PackageReference Include="Scrutor"                                       Version="4.2.2" />
+    <PackageReference Include="Newtonsoft.Json"                                       Version="13.0.3" />
   </ItemGroup>
 
   <ItemGroup>

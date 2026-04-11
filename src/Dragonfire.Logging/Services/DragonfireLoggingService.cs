@@ -26,10 +26,15 @@ namespace Dragonfire.Logging.Services
             _options = options;
         }
 
-        public Task LogAsync(LogEntry entry)
+        public void Log(LogEntry entry)
         {
             _logger.Log(entry.Level, "{@LogEntry}", entry);
             _options.CustomLogAction?.Invoke(entry);
+        }
+
+        public Task LogAsync(LogEntry entry)
+        {
+            Log(entry);
             return Task.CompletedTask;
         }
 
