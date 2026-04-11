@@ -27,7 +27,7 @@ jobs:
         run: dotnet restore Dragonfire.Logging.slnx
 
       - name: Build
-        run: dotnet build Dragonfire.Logging.slnx--configuration Release --no-restore
+        run: dotnet build Dragonfire.Logging.slnx --configuration Release --no-restore
 
       - name: Pack (smoke-test — not published)
         run: dotnet pack Dragonfire.Logging.slnx --configuration Release --no-build --output ./nupkgs
