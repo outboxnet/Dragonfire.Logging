@@ -37,6 +37,16 @@ namespace Dragonfire.Logging.Models
         // ── Common ────────────────────────────────────────────────────────────
         public string? UserId { get; set; }
         public Dictionary<string, object>? CustomData { get; set; }
+
+        /// <summary>
+        /// Individual structured-log properties promoted from <c>[LogProperty]</c>
+        /// attributes on method parameters and DTO properties. Each entry is emitted
+        /// as its own scope key (no <c>Dragonfire.*</c> prefix) so it appears directly
+        /// in <c>customDimensions</c> and is immediately filterable in KQL:
+        /// <code>| where customDimensions["TenantId"] == "acme"</code>
+        /// </summary>
+        public Dictionary<string, object?>? NamedProperties { get; set; }
+
         public long ElapsedMilliseconds { get; set; }
         public bool IsError { get; set; }
         public string? ErrorMessage { get; set; }

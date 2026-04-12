@@ -11,7 +11,8 @@
       "Bash(dotnet new:*)",
       "Bash(dotnet sln:*)",
       "Bash(ls \"D:/Dragonfire.Logging/\"*.sln)",
-      "Bash(dotnet list:*)"
+      "Bash(dotnet list:*)",
+      "Bash(mkdir -p tests/Dragonfire.Logging.Generator.Tests)"
     ]
   }
 }

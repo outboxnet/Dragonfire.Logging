@@ -44,6 +44,17 @@ namespace Dragonfire.Logging.Attributes
         /// </summary>
         public int MaxContentLength { get; set; } = 0;
 
+        /// <summary>
+        /// Maximum nesting depth serialised for request, response, arguments, and result payloads.
+        /// <list type="bullet">
+        ///   <item><c>-1</c> (default) — use <see cref="Configuration.DragonfireLoggingOptions.DefaultMaxDepth"/>.</item>
+        ///   <item><c>0</c> — unlimited depth (full serialisation).</item>
+        ///   <item><c>1</c> — top-level scalar properties only; nested objects/arrays become <c>[N fields]</c> / <c>[N items]</c>.</item>
+        ///   <item><c>N</c> — N levels of nesting preserved.</item>
+        /// </list>
+        /// </summary>
+        public int MaxDepth { get; set; } = -1;
+
         /// <summary>Include HTTP request headers in the log entry. Default: <c>false</c>.</summary>
         public bool LogHeaders { get; set; } = false;
 
