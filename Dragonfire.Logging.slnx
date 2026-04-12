@@ -1,6 +1,7 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/Dragonfire.Logging.AspNetCore/Dragonfire.Logging.AspNetCore.csproj" />
+    <Project Path="src/Dragonfire.Logging.Generator/Dragonfire.Logging.Generator.csproj" />
     <Project Path="src/Dragonfire.Logging/Dragonfire.Logging.csproj" />
   </Folder>
 </Solution>
