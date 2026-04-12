@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Mvc;
 using SampleApp.Models;
+using SampleApp.Services;
 using System.Diagnostics;
 
 namespace SampleApp.Controllers
@@ -8,13 +9,18 @@ namespace SampleApp.Controllers
     {
         private readonly ILogger<HomeController> _logger;
 
-        public HomeController(ILogger<HomeController> logger)
+        IOrderService orderService;
+
+        public HomeController(ILogger<HomeController> logger, IOrderService orderService)
         {
             _logger = logger;
+            this.orderService = orderService;
         }
 
-        public IActionResult Index()
+        public async Task<IActionResult> Index()
         {
+            var resuklt = await orderService.GetOrderAsync("123123", "AAAA");
+
             return View();
         }
 

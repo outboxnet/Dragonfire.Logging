@@ -4,11 +4,11 @@ Production-ready, zero-boilerplate **structured logging** for .NET 8+ services a
 
 ```
 Dragonfire.Logging              — core (framework-agnostic)
-Dragonfire.Logging.AspNetCore   — HTTP request/response logging
-Dragonfire.Logging.Generator    — Roslyn source generator (compile-time proxies)
+Dragonfire.Logging.AspNetCore   — HTTP request/response logging for MVC controllers
+Dragonfire.Logging.Generator    — Roslyn source generator (compile-time proxies, no runtime overhead)
 ```
 
-Every log entry is written as **individually named structured properties** — not one opaque JSON blob — so you can filter, alert and build dashboards against each field directly in Application Insights, Seq, Loki, Datadog, or any ILogger-compatible sink.
+Every log entry writes **individually named structured properties** — not one opaque JSON blob — so you can filter, alert, and build dashboards directly against each field in Application Insights, Seq, Loki, Datadog, or any `ILogger`-compatible sink.
 
 ---
 
@@ -16,34 +16,38 @@ Every log entry is written as **individually named structured properties** — n
 
 1. [What problem does this solve?](#1-what-problem-does-this-solve)
 2. [Package overview](#2-package-overview)
-3. [Quick start — core + ASP.NET Core](#3-quick-start--core--aspnet-core)
-4. [Service-layer interception — runtime proxy](#4-service-layer-interception--runtime-proxy)
-5. [Source generator — compile-time proxy](#5-source-generator--compile-time-proxy)
-   - [Why the generator exists](#why-the-generator-exists)
-   - [Installation](#installation)
+3. [Source generator — service-layer logging](#3-source-generator--service-layer-logging)
    - [How it works](#how-it-works)
+   - [Installation](#installation)
+   - [Annotate your services](#annotate-your-services)
+   - [DI registration and runtime options](#di-registration-and-runtime-options)
    - [What gets generated](#what-gets-generated)
-   - [DI registration](#di-registration)
-6. [Structured logging and Application Insights](#6-structured-logging-and-application-insights)
-7. [[LogProperty] — promote fields to first-class dimensions](#7-logproperty--promote-fields-to-first-class-dimensions)
-8. [Payload depth control](#8-payload-depth-control)
-9. [[Log] attribute reference](#9-log-attribute-reference)
-10. [Sensitive data redaction](#10-sensitive-data-redaction)
-11. [HTTP logging (ASP.NET Core)](#11-http-logging-aspnet-core)
-12. [Configuration reference](#12-configuration-reference)
-13. [Requirements](#13-requirements)
+   - [customDimensions produced](#customdimensions-produced)
+   - [Inspect generated files locally](#inspect-generated-files-locally)
+   - [Verify locally without Application Insights](#verify-locally-without-application-insights)
+4. [ASP.NET MVC — controller request/response logging](#4-aspnet-mvc--controller-requestresponse-logging)
+   - [How it works](#how-it-works-1)
+   - [Installation](#installation-1)
+   - [Annotate your controllers](#annotate-your-controllers)
+   - [[LogProperty] on action parameters and response DTOs](#logproperty-on-action-parameters-and-response-dtos)
+   - [customDimensions produced](#customdimensions-produced-1)
+5. [[LogProperty] reference](#5-logproperty-reference)
+6. [[Log] attribute reference](#6-log-attribute-reference)
+7. [Runtime options reference](#7-runtime-options-reference)
+8. [KQL queries in Application Insights](#8-kql-queries-in-application-insights)
+9. [Requirements](#9-requirements)
 
 ---
 
 ## 1. What problem does this solve?
 
-Writing logging code by hand is tedious, error-prone, and almost never consistent:
+Writing logging code by hand is tedious, inconsistent, and almost always incomplete:
 
 ```csharp
-// What every team ends up with — scattered, inconsistent, incomplete
+// What every team ends up with
 public async Task<Order> CreateOrderAsync(string tenantId, CreateOrderRequest req)
 {
-    _logger.LogInformation("CreateOrder called with tenantId={TenantId}", tenantId);
+    _logger.LogInformation("CreateOrder called tenantId={TenantId}", tenantId);
     var sw = Stopwatch.StartNew();
     try
     {
@@ -53,52 +57,401 @@ public async Task<Order> CreateOrderAsync(string tenantId, CreateOrderRequest re
     }
     catch (Exception ex)
     {
-        _logger.LogError(ex, "CreateOrder failed");
+        _logger.LogError(ex, "CreateOrder failed");  // no elapsed time, no context
         throw;
     }
 }
 ```
 
-Dragonfire.Logging automates this at either **runtime** (via a `DispatchProxy` wrapper registered in DI) or at **compile time** (via a Roslyn source generator that emits a concrete proxy class). In both cases:
+**Dragonfire.Logging automates this at compile time.** The Roslyn source generator reads your attributes at build time and emits a concrete proxy class that:
 
-- Every method call is timed and logged with a consistent structured format
-- Exceptions are captured with stack traces and the `IsError` flag set
-- Request arguments and return values are serialised, filtered, and depth-limited automatically
-- Fields you mark with `[LogProperty]` surface as individual `customDimensions` entries — queryable in KQL without string-parsing
+- Times every call with sub-millisecond precision
+- Logs success and failure with a consistent structured format
+- Promotes `[LogProperty]`-annotated fields directly to `customDimensions` — no JSON parsing in KQL
+- Uses only `ILogger<T>` — zero runtime reflection, zero third-party dependencies
+- Is fully AOT/trim-safe and debuggable (stack traces point to the generated `.g.cs` file)
 
 ---
 
 ## 2. Package overview
 
-| Package | Targets | Purpose |
+| Package | Target | Purpose |
 |---|---|---|
-| `Dragonfire.Logging` | `net8.0` | Core: `ILoggable`, attributes, `DragonfireProxy<T>`, structured `ILogger` output |
-| `Dragonfire.Logging.AspNetCore` | `net8.0` | HTTP filter + middleware for controller and minimal-API request/response logging |
-| `Dragonfire.Logging.Generator` | `netstandard2.0` (analyzer) | Roslyn source generator — emits compile-time concrete proxy classes, zero runtime reflection |
-
-All three packages have **no runtime dependency on Castle.Core, Scrutor, or any other AOP library**. The core and AspNetCore packages depend only on `Microsoft.Extensions.*` abstractions and `Newtonsoft.Json`.
+| `Dragonfire.Logging` | `net8.0` | Core: `ILoggable`, `[Log]`, `[LogProperty]`, `[LogIgnore]` attributes |
+| `Dragonfire.Logging.AspNetCore` | `net8.0` | MVC action filter for controller request/response logging |
+| `Dragonfire.Logging.Generator` | `netstandard2.0` (analyzer) | Roslyn source generator — emits compile-time proxy classes |
 
 ---
 
-## 3. Quick start — core + ASP.NET Core
+## 3. Source generator — service-layer logging
+
+### How it works
+
+At **build time**, the generator:
+
+1. Finds every `class` that implements `ILoggable` (directly or via an interface)
+2. Collects the service interfaces that class also implements (`IOrderService`, etc.)
+3. Reads `[Log]`, `[LogIgnore]`, and `[LogProperty]` attributes from the Roslyn semantic model — no runtime attribute scanning
+4. Emits one concrete proxy class per service, plus shared helpers
+
+The generated proxy uses only `ILogger<T>` and a small generated options class. It has **no dependency on any Dragonfire runtime service** — the generator is self-contained.
+
+| | Runtime proxy (`DispatchProxy`) | Compile-time proxy (generator) |
+|---|---|---|
+| Reflection at startup | Yes | None |
+| Reflection per call | Yes (`MethodInfo.Invoke`) | None — direct virtual dispatch |
+| AOT / NativeAOT | ❌ | ✅ |
+| Trimming | ❌ | ✅ |
+| Debuggability | `DispatchProxy` internals in stack trace | Real `.g.cs` file, full IDE navigation |
+| Build-time visibility | None | Inspectable in `obj/Generated/` |
+
+### Installation
+
+**Project reference** (monorepo / local development):
+
+```xml
+<!-- YourApi.csproj -->
+<ItemGroup>
+  <ProjectReference Include="..\Dragonfire.Logging\Dragonfire.Logging.csproj" />
+
+  <!-- ReferenceOutputAssembly="false" — the generator only runs at build time,
+       its DLL is never added to your app's dependencies. -->
+  <ProjectReference
+      Include="..\Dragonfire.Logging.Generator\Dragonfire.Logging.Generator.csproj"
+      OutputItemType="Analyzer"
+      ReferenceOutputAssembly="false" />
+</ItemGroup>
+```
+
+**NuGet** (published package):
+
+```xml
+<ItemGroup>
+  <PackageReference Include="Dragonfire.Logging"           Version="1.0.0" />
+  <PackageReference Include="Dragonfire.Logging.Generator" Version="1.0.0" />
+</ItemGroup>
+```
+
+### Annotate your services
+
+`ILoggable` can live on the **interface** or the **class** — both patterns work:
+
+```csharp
+using Dragonfire.Logging.Abstractions;
+using Dragonfire.Logging.Attributes;
+using Microsoft.Extensions.Logging;
+
+// ── Pattern A: ILoggable on the interface ────────────────────────────────────
+// Attributes live on the interface. The class needs no logging attributes at all.
+
+public interface IOrderService : ILoggable
+{
+    [Log]
+    Task<Order> GetOrderAsync(
+        [LogProperty("TenantId")] string tenantId,   // → customDimensions["Request.TenantId"]
+        [LogProperty]             string orderId);    // → customDimensions["Request.orderId"]
+
+    [Log(Level = LogLevel.Debug)]
+    void ProcessOrder(string orderId);
+
+    [LogIgnore]                    // pass-through, zero logging overhead
+    string GetVersion();
+}
+
+public class OrderService : IOrderService   // no ILoggable here — inherited via interface
+{
+    public Task<Order> GetOrderAsync(string tenantId, string orderId) { ... }
+    public void ProcessOrder(string orderId) { ... }
+    public string GetVersion() => "1.0";
+}
+
+// ── Pattern B: ILoggable on the class ────────────────────────────────────────
+// Attributes can be on the interface, the class, or both.
+
+public interface IInventoryService
+{
+    Task<int> GetStockAsync([LogProperty("Sku")] string sku);
+}
+
+public class InventoryService : IInventoryService, ILoggable
+{
+    public Task<int> GetStockAsync(string sku) => Task.FromResult(42);
+}
+```
+
+### [LogProperty] on DTO types
+
+Mark properties on request/response DTOs to promote them individually to `customDimensions`:
+
+```csharp
+public class CreateOrderRequest
+{
+    [LogProperty("OrderRef")]   // → customDimensions["Request.OrderRef"]
+    public string ExternalReference { get; set; }
+
+    [LogProperty]               // → customDimensions["Request.Region"]
+    public string Region { get; set; }
+
+    public List<OrderLineDto> Lines { get; set; }  // not promoted — not annotated
+}
+
+public class Order
+{
+    [LogProperty]               // → customDimensions["Response.OrderId"]
+    public string OrderId { get; set; }
+
+    [LogProperty("Price")]      // → customDimensions["Response.Price"]
+    public decimal TotalAmount { get; set; }
+}
+```
+
+The generator reads these annotations at **build time** and emits direct property reads — `__scope["Response.Price"] = __result.TotalAmount;` — no runtime reflection.
+
+### DI registration and runtime options
 
 ```csharp
 // Program.cs
-var builder = WebApplication.CreateBuilder(args);
 
+// 1. Register your services normally
+builder.Services.AddScoped<IOrderService, OrderService>();
+builder.Services.AddScoped<IInventoryService, InventoryService>();
+
+// 2. Wrap all ILoggable services with their generated proxies
+//    The configure lambda is optional — omit it to use all defaults.
+builder.Services.AddDragonfireGeneratedLogging(options =>
+{
+    options.LogRequestProperties  = true;   // include Request.* fields (default: true)
+    options.LogResponseProperties = true;   // include Response.* fields (default: true)
+    options.LogStackTrace         = false;  // omit Dragonfire.StackTrace (default: true)
+    options.OverrideLevel         = null;   // null = use [Log(Level=...)] per method
+
+    // Suppress specific fields by bare name (matches both Request.X and Response.X)
+    options.ExcludeProperties.Add("InternalId");
+    options.ExcludeProperties.Add("RawPayload");
+});
+```
+
+`AddDragonfireGeneratedLogging()` is itself **generated** — it contains exactly one `DecorateService` call per discovered `ILoggable` class. No Scrutor or decoration library is needed.
+
+### What gets generated
+
+For the `IOrderService` above, the generator emits `OrderServiceLoggingProxy.g.cs`:
+
+```csharp
+// <auto-generated/>  — lives in obj/Generated/ at build time
+internal sealed class OrderServiceLoggingProxy : global::MyApp.Services.IOrderService
+{
+    private readonly global::MyApp.Services.IOrderService _innerIOrderService;
+    private readonly global::Microsoft.Extensions.Logging.ILogger<global::MyApp.Services.OrderService> _logger;
+    private readonly global::Dragonfire.Logging.Generated.DragonfireGeneratedLoggingOptions _options;
+
+    public async global::System.Threading.Tasks.Task<global::MyApp.Services.Order> GetOrderAsync(
+        string tenantId, string orderId)
+    {
+        var __scope = new global::Dragonfire.Logging.Generated.__DragonfireScopeState(
+            "[Dragonfire] OrderService.GetOrderAsync");
+        __scope["Dragonfire.ServiceName"] = "OrderService";
+        __scope["Dragonfire.MethodName"]  = "GetOrderAsync";
+
+        // Request fields — guarded by options, resolved at compile time, zero reflection
+        if (_options.LogRequestProperties)
+        {
+            // [LogProperty("TenantId")] on parameter 'tenantId'
+            if (!_options.IsExcluded("TenantId"))
+                __scope["Request.TenantId"] = tenantId;
+
+            // [LogProperty] on parameter 'orderId'
+            if (!_options.IsExcluded("orderId"))
+                __scope["Request.orderId"] = orderId;
+        }
+
+        global::MyApp.Services.Order __result = default!;
+        var __sw = global::System.Diagnostics.Stopwatch.StartNew();
+        try
+        {
+            __result = await _innerIOrderService.GetOrderAsync(tenantId, orderId)
+                .ConfigureAwait(false);
+
+            // Response fields — from [LogProperty] on Order properties
+            if (_options.LogResponseProperties && __result is not null)
+            {
+                // [LogProperty] on result.OrderId
+                if (!_options.IsExcluded("OrderId"))
+                    __scope["Response.OrderId"] = __result.OrderId;
+
+                // [LogProperty("Price")] on result.TotalAmount
+                if (!_options.IsExcluded("Price"))
+                    __scope["Response.Price"] = __result.TotalAmount;
+            }
+
+            __sw.Stop();
+            __scope["Dragonfire.ElapsedMs"] = __sw.Elapsed.TotalMilliseconds;
+            using (_logger.BeginScope(__scope))
+                _logger.Log(
+                    _options.OverrideLevel ?? global::Microsoft.Extensions.Logging.LogLevel.Information,
+                    "[Dragonfire] {Dragonfire_ServiceName}.{Dragonfire_MethodName} completed in {Dragonfire_ElapsedMs}ms",
+                    "OrderService", "GetOrderAsync", __sw.Elapsed.TotalMilliseconds);
+        }
+        catch (global::System.Exception __ex)
+        {
+            __sw.Stop();
+            __scope["Dragonfire.ElapsedMs"]    = __sw.Elapsed.TotalMilliseconds;
+            __scope["Dragonfire.IsError"]      = true;
+            __scope["Dragonfire.ErrorMessage"] = __ex.Message;
+            if (_options.LogStackTrace)
+                __scope["Dragonfire.StackTrace"] = __ex.StackTrace;
+            using (_logger.BeginScope(__scope))
+                _logger.Log(
+                    _options.OverrideLevel ?? global::Microsoft.Extensions.Logging.LogLevel.Error,
+                    __ex,
+                    "[Dragonfire] {Dragonfire_ServiceName}.{Dragonfire_MethodName} FAILED in {Dragonfire_ElapsedMs}ms — {Dragonfire_ErrorMessage}",
+                    "OrderService", "GetOrderAsync", __sw.Elapsed.TotalMilliseconds, __ex.Message);
+            throw;
+        }
+        return __result;
+    }
+
+    // [LogIgnore] → pure pass-through, zero logging overhead
+    public string GetVersion() => _innerIOrderService.GetVersion();
+}
+```
+
+Key properties:
+- **No `MethodInfo.Invoke`** — all calls are direct virtual dispatch
+- **No JSON serialisation** — only explicitly annotated `[LogProperty]` fields are captured
+- **No runtime reflection** — DTO property reads are direct C# property accesses, resolved at build time
+- **`[LogIgnore]`** produces a one-liner — zero overhead
+
+### customDimensions produced
+
+For a successful `GetOrderAsync` call:
+
+```json
+{
+  "Message":                  "[Dragonfire] OrderService.GetOrderAsync",
+  "Dragonfire.ServiceName":   "OrderService",
+  "Dragonfire.MethodName":    "GetOrderAsync",
+  "Request.TenantId":         "acme-corp",
+  "Request.orderId":          "ORD-123",
+  "Response.OrderId":         "ORD-123",
+  "Response.Price":           49.99,
+  "Dragonfire.ElapsedMs":     1.847
+}
+```
+
+On error, the scope additionally includes:
+
+```json
+{
+  "Dragonfire.IsError":       true,
+  "Dragonfire.ErrorMessage":  "Value cannot be null.",
+  "Dragonfire.StackTrace":    "   at OrderService.GetOrderAsync ..."
+}
+```
+
+### Inspect generated files locally
+
+Add to your `.csproj` to write `.g.cs` files to disk during build:
+
+```xml
+<PropertyGroup>
+  <EmitCompilerGeneratedFiles>true</EmitCompilerGeneratedFiles>
+  <CompilerGeneratedFilesOutputPath>$(BaseIntermediateOutputPath)Generated</CompilerGeneratedFilesOutputPath>
+</PropertyGroup>
+```
+
+Files land at:
+
+```
+obj/Debug/net8.0/Generated/
+  Dragonfire.Logging.Generator/
+    Dragonfire.Logging.Generator.LoggingProxyGenerator/
+      OrderServiceLoggingProxy.g.cs
+      InventoryServiceLoggingProxy.g.cs
+      DragonfireGeneratedExtensions.g.cs       ← AddDragonfireGeneratedLogging()
+      DragonfireGeneratedLoggingOptions.g.cs   ← runtime options class
+      DragonfireGeneratedScopeState.g.cs       ← scope wrapper
+```
+
+### Verify locally without Application Insights
+
+The default console logger drops scope data. Use the JSON console formatter to see every `customDimension` locally:
+
+```csharp
+// Program.cs — development only
+builder.Logging.AddJsonConsole(o =>
+{
+    o.IncludeScopes     = true;
+    o.JsonWriterOptions = new System.Text.Json.JsonWriterOptions { Indented = true };
+});
+```
+
+Or in `appsettings.Development.json` (no code change needed):
+
+```json
+{
+  "Logging": {
+    "Console": {
+      "FormatterName": "json",
+      "FormatterOptions": {
+        "IncludeScopes": true,
+        "JsonWriterOptions": { "Indented": true }
+      }
+    }
+  }
+}
+```
+
+For a full local UI with search and filters — identical to Application Insights — run Seq in Docker:
+
+```bash
+docker run --name seq -d -e ACCEPT_EULA=Y -p 5341:5341 -p 80:80 datalust/seq
+```
+
+```bash
+dotnet add package Seq.Extensions.Logging
+```
+
+```csharp
+builder.Logging.AddSeq("http://localhost:5341");
+```
+
+Open `http://localhost` — every scope property is a searchable field.
+
+---
+
+## 4. ASP.NET MVC — controller request/response logging
+
+### How it works
+
+`Dragonfire.Logging.AspNetCore` registers a global `IAsyncActionFilter` (`DragonfireLoggingFilter`) that runs at `int.MinValue` (outermost filter position). It:
+
+1. Captures action **parameters** before execution — reads them directly from the action's argument dictionary
+2. Executes the inner pipeline
+3. Reads the **response** from `ObjectResult.Value` — the response stream is never replaced or buffered
+4. Writes a structured log entry via `ILogger.BeginScope` with the same `customDimensions` schema as the service generator
+
+`[Log]`, `[LogProperty]`, and `[LogIgnore]` work on **controllers and actions** the same way they work on services.
+
+### Installation
+
+```xml
+<!-- YourApi.csproj -->
+<ItemGroup>
+  <ProjectReference Include="..\Dragonfire.Logging.AspNetCore\Dragonfire.Logging.AspNetCore.csproj" />
+  <!-- or: <PackageReference Include="Dragonfire.Logging.AspNetCore" Version="1.0.0" /> -->
+</ItemGroup>
+```
+
+```csharp
+// Program.cs
 builder.Services.AddControllers();
-
-// 1. Register your services
-builder.Services.AddScoped<IOrderService, OrderService>();   // OrderService : ILoggable
-
-// 2. Add Dragonfire — core + HTTP
 builder.Services.AddDragonfireAspNetCore(
     core: opt =>
     {
-        opt.EnableServiceInterception = true;   // wrap ILoggable services with the runtime proxy
-        opt.DefaultMaxDepth           = 1;      // 1-level-deep payload serialisation (default)
-        opt.DefaultMaxContentLength   = 10_000;
-        opt.SensitiveDataPolicy.SensitiveFields.Add("apiKey");
+        opt.DefaultMaxDepth         = 1;
+        opt.DefaultMaxContentLength = 10_000;
+        opt.IncludeStackTraceOnError = true;
     },
     http: opt =>
     {
@@ -108,522 +461,116 @@ builder.Services.AddDragonfireAspNetCore(
     });
 
 var app = builder.Build();
-
-app.UseDragonfireLogging();   // adds the middleware (needed for minimal APIs)
+app.UseDragonfireLogging();  // middleware for minimal APIs; safe to include for controllers too
 app.MapControllers();
 app.Run();
 ```
 
----
-
-## 4. Service-layer interception — runtime proxy
-
-Mark any service class with `ILoggable`:
+### Annotate your controllers
 
 ```csharp
-using Dragonfire.Logging.Abstractions;
+using Dragonfire.Logging.Attributes;
+using Microsoft.Extensions.Logging;
 
-public class OrderService : IOrderService, ILoggable
+// [Log] on the controller sets defaults for all actions.
+// Individual actions can override or opt out.
+[ApiController]
+[Route("api/[controller]")]
+[Log(Level = LogLevel.Information)]
+public class OrdersController : ControllerBase
 {
-    public async Task<Order> CreateOrderAsync(string tenantId, CreateOrderRequest request)
+    // Uses controller-level [Log] — logs request parameters and ObjectResult response
+    [HttpGet("{orderId}")]
+    public async Task<ActionResult<Order>> GetOrder(
+        [LogProperty("TenantId")] string tenantId,   // → customDimensions["Request.TenantId"]
+        string orderId)                               // not annotated — not promoted
     {
-        // ... real implementation
+        var order = await _orderService.GetOrderAsync(tenantId, orderId);
+        return Ok(order);
     }
-}
-```
 
-With `EnableServiceInterception = true`, Dragonfire finds every registered service whose concrete implementation carries `ILoggable` and wraps it with a `DispatchProxy`-based logging proxy — **no code changes inside the service, no attributes required**.
-
-### How the runtime proxy works
-
-```
-IOrderService (DI) ──resolves──► OrderServiceLoggingProxy (DispatchProxy)
-                                        │
-                                   ┌────▼────────────────────────────────┐
-                                   │  1. Build LogEntry (service, method) │
-                                   │  2. FilterData(args, maxDepth)       │
-                                   │  3. Extract [LogProperty] fields     │
-                                   │  4. Call _inner.Method(args)         │
-                                   │  5. Capture result / exception       │
-                                   │  6. LogAsync(entry) via ILogger      │
-                                   └─────────────────────────────────────┘
-```
-
-The proxy uses `System.Reflection.DispatchProxy` — a **built-in .NET type**, no third-party AOP library involved.
-
----
-
-## 5. Source generator — compile-time proxy
-
-### Why the generator exists
-
-The runtime `DispatchProxy` approach works well but has two costs:
-
-| | Runtime proxy (`DispatchProxy`) | Compile-time proxy (generator) |
-|---|---|---|
-| **Reflection at startup** | Yes — `MakeGenericType`, `GetMethod` per service | None — concrete class exists at build time |
-| **Reflection per call** | Yes — `MethodInfo.Invoke` | None — direct virtual dispatch |
-| **Debuggability** | Stack frames show `DispatchProxy` internals | Stack frames show your actual proxy class |
-| **AOT / NativeAOT** | ❌ Not compatible | ✅ Fully compatible |
-| **Trimming** | ❌ Requires trim-unsafe reflection | ✅ Trim-safe |
-| **IDE "go to definition"** | Goes to DispatchProxy | Goes to the generated `.g.cs` file |
-| **Build-time visibility** | No | Generated file inspectable in `obj/Generated/` |
-
-**Choose the generator** when you care about startup time, NativeAOT, trimming, or just want cleaner stack traces and full IDE navigation.
-
-### Installation
-
-**Via project reference** (monorepo / local development):
-
-```xml
-<!-- YourApi.csproj -->
-<ItemGroup>
-  <ProjectReference Include="..\Dragonfire.Logging\Dragonfire.Logging.csproj" />
-
-  <!-- Generator: OutputItemType="Analyzer" tells MSBuild to run it as a source generator.
-       ReferenceOutputAssembly="false" means its DLL is NOT added to your app's references
-       — the generator only runs at build time and produces .cs files, nothing more. -->
-  <ProjectReference
-      Include="..\Dragonfire.Logging.Generator\Dragonfire.Logging.Generator.csproj"
-      OutputItemType="Analyzer"
-      ReferenceOutputAssembly="false" />
-</ItemGroup>
-```
-
-**Via NuGet** (published package):
-
-```xml
-<ItemGroup>
-  <PackageReference Include="Dragonfire.Logging"           Version="1.0.0" />
-  <PackageReference Include="Dragonfire.Logging.Generator" Version="1.0.0" />
-</ItemGroup>
-```
-
-When installed from NuGet the generator DLL lives in `analyzers/dotnet/cs/` inside the package. MSBuild picks it up automatically — no `OutputItemType` needed.
-
-> **Note:** Do not use `EnableServiceInterception = true` at the same time as the generator — they serve the same purpose. Pick one approach.
-
-### How it works
-
-At **build time**, the generator:
-
-1. Scans every `class` declaration that has a non-empty base list
-2. Checks if the class's semantic symbol implements `Dragonfire.Logging.Abstractions.ILoggable`
-3. Collects all non-framework interfaces the class also implements (`IOrderService`, etc.)
-4. Reads `[Log]`, `[LogIgnore]`, and `[LogProperty]` attributes from the Roslyn semantic model
-5. Emits one `{ClassName}LoggingProxy.g.cs` per service **and** a shared `DragonfireGeneratedExtensions.g.cs`
-
-The generator runs incrementally — only re-generates files for types whose syntax or attributes changed. Clean builds are fast; incremental builds are near-instant.
-
-### What gets generated
-
-Given this service:
-
-```csharp
-public interface IOrderService
-{
-    Task<Order> GetOrderAsync(
+    // Override log level per action
+    [HttpPost]
+    [Log(Level = LogLevel.Warning)]
+    public async Task<ActionResult<Order>> CreateOrder(
         [LogProperty("TenantId")] string tenantId,
-        string orderId);
-
-    [Log(MaxDepth = 0, Level = LogLevel.Debug)]
-    void ProcessOrder(string orderId);
-
-    [LogIgnore]
-    string GetVersion();
-}
-
-public class OrderService : IOrderService, ILoggable
-{
-    public Task<Order> GetOrderAsync(string tenantId, string orderId) { ... }
-    public void ProcessOrder(string orderId) { ... }
-    public string GetVersion() => "1.0";
-}
-```
-
-The generator emits `OrderServiceLoggingProxy.g.cs`:
-
-```csharp
-// <auto-generated/>
-// Generated by Dragonfire.Logging.Generator
-#nullable enable
-
-namespace MyApp.Services.Generated
-{
-    [GeneratedCode("Dragonfire.Logging.Generator", "1.0.0")]
-    [DebuggerNonUserCode]
-    internal sealed class OrderServiceLoggingProxy : global::MyApp.Services.IOrderService
+        [FromBody] CreateOrderRequest request)
     {
-        private readonly global::MyApp.Services.IOrderService _innerIOrderService;
-        private readonly IDragonfireLoggingService _loggingService;
-        private readonly ILogFilterService _filterService;
-        private readonly DragonfireLoggingOptions _options;
+        var order = await _orderService.CreateOrderAsync(tenantId, request);
+        return Created($"/api/orders/{order.OrderId}", order);
+    }
 
-        public OrderServiceLoggingProxy(
-            global::MyApp.Services.IOrderService inner,
-            IDragonfireLoggingService loggingService,
-            ILogFilterService filterService,
-            DragonfireLoggingOptions options) { ... }
-
-        // ── GetOrderAsync — async Task<T>, [LogProperty] on first param ──────
-        public async Task<Order> GetOrderAsync(string tenantId, string orderId)
-        {
-            var __entry = new LogEntry
-            {
-                ServiceName = "OrderService",
-                MethodName  = "GetOrderAsync",
-                Level       = _options.DefaultLogLevel,
-            };
-
-            // Arguments serialised at global DefaultMaxDepth (1 by default)
-            __entry.MethodArguments = _filterService.FilterData(
-                new object?[] { tenantId, orderId }, null, null,
-                _options.DefaultMaxContentLength, _options.DefaultMaxDepth);
-
-            // [LogProperty("TenantId")] captured directly — NO reflection
-            __entry.NamedProperties ??= new Dictionary<string, object?>();
-            __entry.NamedProperties.TryAdd("TenantId", tenantId);
-
-            var __sw = Stopwatch.StartNew();
-            Order __result = default!;
-            try
-            {
-                __result = await _innerIOrderService.GetOrderAsync(tenantId, orderId)
-                    .ConfigureAwait(false);
-
-                __entry.MethodResult = _filterService.FilterData(
-                    __result, null, null,
-                    _options.DefaultMaxContentLength, _options.DefaultMaxDepth);
-            }
-            catch (Exception __ex)
-            {
-                __entry.IsError      = true;
-                __entry.Level        = LogLevel.Error;
-                __entry.ErrorMessage = __ex.Message;
-                if (_options.IncludeStackTraceOnError)
-                    __entry.StackTrace = __ex.StackTrace;
-                throw;
-            }
-            finally
-            {
-                __sw.Stop();
-                __entry.ElapsedMilliseconds = __sw.ElapsedMilliseconds;
-                await _loggingService.LogAsync(__entry).ConfigureAwait(false);
-            }
-
-            return __result;
-        }
-
-        // ── ProcessOrder — [Log(MaxDepth = 0, Level = Debug)] ────────────────
-        // MaxDepth = 0 emitted as a literal integer — resolved at compile time
-        public void ProcessOrder(string orderId)
-        {
-            var __entry = new LogEntry { ..., Level = LogLevel.Debug };
-            __entry.MethodArguments = _filterService.FilterData(
-                new object?[] { orderId }, null, null,
-                _options.DefaultMaxContentLength, 0 /* MaxDepth=0 = unlimited */);
-            // ... try/catch/finally calling _loggingService.Log(__entry)
-        }
-
-        // ── GetVersion — [LogIgnore] → pure pass-through, zero overhead ──────
-        public string GetVersion() => _innerIOrderService.GetVersion();
+    // Exempt sensitive actions from logging entirely
+    [HttpDelete("{orderId}")]
+    [LogIgnore]
+    public async Task<IActionResult> DeleteOrder(string orderId)
+    {
+        await _orderService.DeleteOrderAsync(orderId);
+        return NoContent();
     }
 }
 ```
 
-Key observations:
-- **No `MethodInfo.Invoke`** — all calls are direct virtual dispatch
-- **No `MakeGenericType`** — generic Task dispatch resolved at compile time
-- **`[LogProperty]` captured with a literal assignment** — `TryAdd("TenantId", tenantId)` — no reflection, no attribute scanning at runtime
-- **`[Log(MaxDepth = 0)]`** emits `0` as a literal — the attribute is consumed entirely at build time
-- **`[LogIgnore]`** produces a one-liner pass-through — method excluded from all logging infrastructure
+### [LogProperty] on action parameters and response DTOs
 
-### DI registration
+Works identically to the service generator:
 
 ```csharp
-// Program.cs
-
-// 1. Register services normally
-builder.Services.AddScoped<IOrderService, OrderService>();
-builder.Services.AddScoped<IInventoryService, InventoryService>(); // also : ILoggable
-
-// 2. Add core Dragonfire (but do NOT set EnableServiceInterception — the generator handles wrapping)
-builder.Services.AddDragonfireLogging(opt =>
-{
-    opt.DefaultMaxDepth         = 1;
-    opt.DefaultMaxContentLength = 10_000;
-});
-
-// 3. Wrap all ILoggable services with their generated proxies
-//    This single call replaces every ILoggable service registration with its proxy.
-builder.Services.AddDragonfireGeneratedLogging();
-```
-
-`AddDragonfireGeneratedLogging()` is itself **generated** — it contains one `DecorateService(...)` call per discovered `ILoggable` class. It includes its own inline `DecorateService`/`ResolveInner` helpers; no Scrutor or other decoration library is needed.
-
-### Inspect the generated files
-
-Enable `EmitCompilerGeneratedFiles` to write the `.g.cs` files to disk:
-
-```xml
-<!-- YourApi.csproj -->
-<PropertyGroup>
-  <EmitCompilerGeneratedFiles>true</EmitCompilerGeneratedFiles>
-  <CompilerGeneratedFilesOutputPath>$(BaseIntermediateOutputPath)Generated</CompilerGeneratedFilesOutputPath>
-</PropertyGroup>
-```
-
-Files appear at:
-```
-obj/Debug/net8.0/Generated/
-  Dragonfire.Logging.Generator/
-    Dragonfire.Logging.Generator.LoggingProxyGenerator/
-      OrderServiceLoggingProxy.g.cs
-      DragonfireGeneratedExtensions.g.cs
-```
-
----
-
-## 6. Structured logging and Application Insights
-
-Every log entry is written via `ILogger.BeginScope(Dictionary<string, object>)` with individually named properties. **Each field gets its own key** — nothing is buried in a single serialised JSON string.
-
-### Properties emitted for every entry
-
-| Scope key | Example value | When set |
-|---|---|---|
-| `Dragonfire.CorrelationId` | `"d4f2…"` | Always |
-| `Dragonfire.TraceId` | `"00-4b3a…"` | When `Activity.Current` is set |
-| `Dragonfire.ServiceName` | `"OrderService"` | Service-layer entries |
-| `Dragonfire.MethodName` | `"CreateOrderAsync"` | Service-layer entries |
-| `Dragonfire.HttpMethod` | `"POST"` | HTTP entries |
-| `Dragonfire.Path` | `"/api/orders"` | HTTP entries |
-| `Dragonfire.StatusCode` | `200` | HTTP entries |
-| `Dragonfire.ElapsedMs` | `42` | Always |
-| `Dragonfire.IsError` | `true` | Only on errors |
-| `Dragonfire.ErrorMessage` | `"Object not found"` | Only on errors |
-| `Dragonfire.StackTrace` | `"at …"` | Errors, when enabled |
-| `Dragonfire.RequestData` | `{"orderId":"x"}` | Serialised payload (filtered) |
-| `Dragonfire.ResponseData` | `{"status":"ok"}` | Serialised payload (filtered) |
-| `Dragonfire.Custom.{Key}` | any | From `AddCustomData()` |
-| `{YourKey}` | `"acme"` | `[LogProperty]`-promoted fields |
-
-### KQL queries in Application Insights
-
-```kql
-// All failed calls to any service in the last hour
-traces
-| where timestamp > ago(1h)
-| where customDimensions["Dragonfire.IsError"] == "True"
-| project timestamp, customDimensions["Dragonfire.ServiceName"],
-          customDimensions["Dragonfire.MethodName"],
-          customDimensions["Dragonfire.ErrorMessage"]
-
-// P95 latency per method
-traces
-| where isnotempty(customDimensions["Dragonfire.ElapsedMs"])
-| summarize percentile(toint(customDimensions["Dragonfire.ElapsedMs"]), 95)
-    by tostring(customDimensions["Dragonfire.MethodName"])
-
-// All orders for a specific tenant (via [LogProperty("TenantId")])
-traces
-| where customDimensions["TenantId"] == "acme-corp"
-| project timestamp, customDimensions["Dragonfire.MethodName"],
-          customDimensions["Dragonfire.ElapsedMs"]
-```
-
----
-
-## 7. [LogProperty] — promote fields to first-class dimensions
-
-By default, method arguments and return values are serialised as a JSON snapshot in `Dragonfire.RequestData` / `Dragonfire.MethodArguments`. Filtering for a specific tenant requires parsing that JSON string.
-
-`[LogProperty]` solves this: it promotes a **specific value** to its own named scope key that appears directly in `customDimensions` — no JSON parsing, directly queryable.
-
-### On a method parameter
-
-```csharp
-public async Task<Order> CreateOrderAsync(
-    [LogProperty("TenantId")] string tenantId,
-    [LogProperty]             string customerId,   // key = "customerId"
-    CreateOrderRequest        request)             // not promoted individually
-{ ... }
-```
-
-### On a DTO property
-
-```csharp
+// Request DTO — annotated properties surface as Request.* in customDimensions
 public class CreateOrderRequest
 {
-    [LogProperty("OrderRef")]   // key = "OrderRef" in customDimensions
+    [LogProperty("OrderRef")]   // → customDimensions["Request.OrderRef"]
     public string ExternalReference { get; set; }
 
-    [LogProperty]               // key = "Region"
+    [LogProperty]               // → customDimensions["Request.Region"]
     public string Region { get; set; }
 
-    public List<OrderLineDto> Lines { get; set; }   // not promoted
+    public string InternalNotes { get; set; }  // not promoted
+}
+
+// Response DTO — annotated properties surface as Response.* in customDimensions
+public class Order
+{
+    [LogProperty]               // → customDimensions["Response.OrderId"]
+    public string OrderId { get; set; }
+
+    [LogProperty("Price")]      // → customDimensions["Response.Price"]
+    public decimal TotalAmount { get; set; }
+
+    public string InternalState { get; set; }  // not promoted
 }
 ```
 
-Both are supported at the same time. The runtime proxy uses `ILogFilterService.ExtractNamedProperties()` for DTO properties; the **source generator emits the DTO extraction as a direct `_filterService.ExtractNamedProperties(request)` call, and captures parameter-level `[LogProperty]` with a simple field assignment** — no reflection involved at the parameter level.
+### customDimensions produced
 
-### Result in Application Insights
-
-```kql
-// Before [LogProperty] — must parse JSON
-traces
-| where customDimensions["Dragonfire.MethodArguments"] contains "acme-corp"
-
-// After [LogProperty] — direct indexed lookup, 10-100× faster
-traces
-| where customDimensions["TenantId"] == "acme-corp"
-```
-
----
-
-## 8. Payload depth control
-
-By default, request/response/argument payloads are serialised **1 level deep**. Nested objects beyond that depth are replaced with a compact placeholder:
+For a successful `POST /api/orders` call:
 
 ```json
 {
-  "orderId": "ORD-123",
-  "customer": "[3 fields]",
-  "lines":    "[5 items]"
+  "Dragonfire.ServiceName":   "OrdersController",
+  "Dragonfire.MethodName":    "CreateOrder",
+  "Dragonfire.HttpMethod":    "POST",
+  "Dragonfire.Path":          "/api/orders",
+  "Dragonfire.StatusCode":    201,
+  "Dragonfire.ElapsedMs":     23.441,
+  "Request.TenantId":         "acme-corp",
+  "Request.OrderRef":         "EXT-9981",
+  "Request.Region":           "EU-WEST",
+  "Response.OrderId":         "ORD-456",
+  "Response.Price":           149.99
 }
 ```
 
-This keeps logs concise and avoids accidentally logging deeply nested sensitive structures.
+On a 500 error:
 
-### Opt out globally
-
-```csharp
-builder.Services.AddDragonfireLogging(opt =>
+```json
 {
-    opt.DefaultMaxDepth = 0;  // 0 = unlimited — full serialisation
-});
-```
-
-### Opt out per method
-
-```csharp
-[Log(MaxDepth = 0)]   // unlimited for this action/method only
-public async Task<OrderDetail> GetOrderDetailAsync(string id) { ... }
-
-[Log(MaxDepth = 3)]   // 3 levels deep for this method
-public async Task<Report> GenerateReportAsync(ReportRequest req) { ... }
-```
-
-### Depth semantics
-
-| `MaxDepth` value | Behaviour |
-|---|---|
-| `0` | Unlimited — full serialisation |
-| `1` (default) | Top-level scalar properties only; nested objects/arrays → `[N fields]` / `[N items]` |
-| `N` | N levels of nesting preserved |
-| `-1` (on `[Log]`) | Use `DragonfireLoggingOptions.DefaultMaxDepth` |
-
-The **source generator resolves `[Log(MaxDepth)]` at compile time** and emits the resolved integer as a literal — no options lookup at runtime for the depth value.
-
----
-
-## 9. [Log] attribute reference
-
-Apply to a class (default for all members) or a method (overrides class-level):
-
-```csharp
-[Log(
-    LogRequest        = true,          // log arguments / request body
-    LogResponse       = true,          // log return value / response body
-    LogValidationErrors = true,        // include ModelState errors (ASP.NET Core)
-    Level             = LogLevel.Information,
-    MaxContentLength  = 5_000,         // truncate payloads to 5 KB (0 = unlimited)
-    MaxDepth          = 1,             // nesting depth (-1 = use global default)
-    ExcludeProperties = new[] { "CardNumber", "Cvv" },
-    IncludeProperties = new[] { },     // when non-empty, ONLY these properties are kept
-    LogHeaders        = false,         // include HTTP request headers
-    ExcludeHeaders    = new[] { "Authorization", "Cookie", "X-API-Key" },
-    CustomContext     = "payment-flow" // free-text annotation in every log entry
-)]
-```
-
-### [LogIgnore]
-
-```csharp
-// On a property — removed from every serialised payload
-public class UserDto
-{
-    [LogIgnore("PCI compliance")]
-    public string CardNumber { get; set; }
+  "Dragonfire.IsError":       true,
+  "Dragonfire.StatusCode":    500,
+  "Dragonfire.ErrorMessage":  "Database timeout",
+  "Dragonfire.StackTrace":    "   at OrderService.CreateOrderAsync ..."
 }
-
-// On a method — proxy passes through with ZERO logging overhead
-[LogIgnore]
-public string GetHealthStatus() => "ok";
-
-// On a class — disables logging for all methods
-[LogIgnore]
-public class DiagnosticsService : IDiagnosticsService, ILoggable { ... }
 ```
-
----
-
-## 10. Sensitive data redaction
-
-Redaction runs on every serialised payload, applied **after** property filtering.
-
-```csharp
-builder.Services.AddDragonfireLogging(opt =>
-{
-    var policy = opt.SensitiveDataPolicy;
-
-    // Field names — properties are removed entirely
-    policy.SensitiveFields.Add("ssn");
-    policy.SensitiveFields.Add("privateKey");
-
-    // Regex patterns — matched content replaced
-    policy.RedactionPatterns.Add((
-        new Regex(@"\b4[0-9]{12}(?:[0-9]{3})?\b"),  // Visa card numbers
-        "[CARD_REDACTED]"));
-
-    // Built-in toggles
-    policy.RedactEmails      = true;   // default: true
-    policy.RedactPhoneNumbers = true;  // default: true
-});
-```
-
-### Built-in redactions (always active)
-
-| Category | Pattern | Replacement |
-|---|---|---|
-| Sensitive field names | `password`, `secret`, `token`, `authorization`, `cvv`, `ssn` | Property removed |
-| Credit card numbers | Luhn-range regex | `[CREDIT_CARD_REDACTED]` |
-| SSNs | `NNN-NN-NNNN` | `[SSN_REDACTED]` |
-| JWT Bearer tokens | `Bearer eyJ…` | `Bearer [JWT_REDACTED]` |
-| Email addresses | RFC 5322 pattern | `[EMAIL_REDACTED]` |
-| Phone numbers | `NNN-NNN-NNNN` variants | `[PHONE_REDACTED]` |
-
----
-
-## 11. HTTP logging (ASP.NET Core)
-
-`Dragonfire.Logging.AspNetCore` provides two complementary hooks:
-
-### MVC / Web API controllers — `DragonfireLoggingFilter`
-
-Registered as a global `IAsyncActionFilter` at order `int.MinValue` (outermost). Reads the response via `ObjectResult.Value` — **the response body stream is never replaced or hijacked**.
-
-Supports `[Log]` and `[LogIgnore]` on controllers and actions.
-
-### Minimal APIs — `DragonfireLoggingMiddleware`
-
-```csharp
-app.UseDragonfireLogging();  // must be called before app.MapGet/MapPost/...
-```
-
-### Correlation ID propagation
-
-Every request gets a `X-Correlation-ID` header echoed back in the response. If the caller sends one it is reused; otherwise a new GUID is generated. The same ID appears in every log entry for that request.
 
 ### Excluding paths
 
@@ -631,52 +578,156 @@ Every request gets a `X-Correlation-ID` header echoed back in the response. If t
 http: opt => opt.ExcludePaths = new[] { "/health", "/metrics", "/swagger", "/favicon.ico" }
 ```
 
----
+### Correlation ID
 
-## 12. Configuration reference
-
-### `DragonfireLoggingOptions` (core)
-
-| Property | Default | Description |
-|---|---|---|
-| `EnableServiceInterception` | `false` | Auto-wrap `ILoggable` services with the runtime `DispatchProxy`. Set to `false` when using the source generator. |
-| `DefaultMaxDepth` | `1` | Default payload nesting depth. `0` = unlimited. |
-| `DefaultMaxContentLength` | `10 000` | Truncate serialised payloads to this many characters. `0` = unlimited. |
-| `IncludeStackTraceOnError` | `true` | Append `StackTrace` to error log entries. |
-| `DefaultLogLevel` | `Information` | Level used when no `[Log]` attribute is present. |
-| `SensitiveDataPolicy` | (see above) | Redaction rules applied to all payloads. |
-| `CustomLogAction` | `null` | Optional `Action<LogEntry>` callback — forward entries to a custom sink after the standard `ILogger` write. |
-| `LoggingServiceLifetime` | `Scoped` | DI lifetime for `IDragonfireLoggingService`. |
-
-### `DragonfireAspNetCoreOptions` (ASP.NET Core)
-
-| Property | Default | Description |
-|---|---|---|
-| `EnableRequestLogging` | `true` | Log inbound request arguments and body. |
-| `EnableResponseLogging` | `true` | Log outbound response body (from `ObjectResult.Value`). |
-| `LogValidationErrors` | `true` | Include `ModelState` errors in the log entry. |
-| `ExcludePaths` | `[]` | Path prefixes to skip entirely (health checks, swagger, etc.). |
-| `CaptureResponseBodyInMiddleware` | `false` | Opt-in stream capture for minimal API response bodies. |
+Every request gets a `X-Correlation-ID` header echoed back in the response. If the caller sends one it is reused; otherwise a new GUID is generated and appears in every log entry for that request.
 
 ---
 
-## 13. Requirements
+## 5. [LogProperty] reference
+
+| Usage | Syntax | customDimensions key |
+|---|---|---|
+| Parameter — named | `[LogProperty("TenantId")] string tenantId` | `Request.TenantId` |
+| Parameter — use param name | `[LogProperty] string orderId` | `Request.orderId` |
+| DTO property — named | `[LogProperty("OrderRef")] public string Ext { get; set; }` | `Request.OrderRef` (when on a param type) or `Response.OrderRef` (when on a return type) |
+| DTO property — use prop name | `[LogProperty] public string Region { get; set; }` | `Request.Region` / `Response.Region` |
+
+`[LogProperty]` can go on:
+- Service interface method parameters (picked up by the source generator)
+- Service class method parameters
+- Controller action parameters (picked up by the ASP.NET Core filter)
+- Properties of any DTO class that appears as a parameter or return type
+
+The `Request.` / `Response.` prefix is applied automatically — you never write it in the attribute.
+
+---
+
+## 6. [Log] attribute reference
+
+Apply to a class (default for all members) or a method (overrides class-level default):
+
+```csharp
+[Log(
+    Level    = LogLevel.Information,  // log level for success path
+    MaxDepth = 1                      // reserved for future payload capture; currently unused by generator
+)]
+```
+
+### [LogIgnore]
+
+```csharp
+// On a method — proxy passes through with ZERO logging overhead
+[LogIgnore]
+public string GetHealthStatus() => "ok";
+
+// On a class — disables logging for all methods on this service
+[LogIgnore]
+public class DiagnosticsService : IDiagnosticsService, ILoggable { ... }
+
+// On a property — excluded from [LogProperty] DTO scanning
+public class OrderRequest
+{
+    [LogIgnore]
+    public string InternalAuditCode { get; set; }
+}
+```
+
+---
+
+## 7. Runtime options reference
+
+`DragonfireGeneratedLoggingOptions` is itself generated — it lives in your assembly alongside the proxy classes. Configure it at registration time:
+
+```csharp
+builder.Services.AddDragonfireGeneratedLogging(options =>
+{
+    options.LogRequestProperties  = true;
+    options.LogResponseProperties = true;
+    options.LogStackTrace         = true;
+    options.OverrideLevel         = null;
+    options.ExcludeProperties.Add("SensitiveField");
+});
+```
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `LogRequestProperties` | `bool` | `true` | Include all `Request.*` scope entries (from `[LogProperty]` on parameters and their DTO types) |
+| `LogResponseProperties` | `bool` | `true` | Include all `Response.*` scope entries (from `[LogProperty]` on the return type's properties) |
+| `LogStackTrace` | `bool` | `true` | Include `Dragonfire.StackTrace` in error scope. Disable to reduce log size in production |
+| `ExcludeProperties` | `ISet<string>` | empty | Bare property names to suppress (case-insensitive). `"OrderId"` suppresses both `Request.OrderId` and `Response.OrderId` |
+| `OverrideLevel` | `LogLevel?` | `null` | Override the success log level for all methods. `null` = use the `[Log(Level = ...)]` attribute value. Error logs always use `LogLevel.Error` regardless of this setting |
+
+---
+
+## 8. KQL queries in Application Insights
+
+```kql
+// All failed service calls in the last hour
+traces
+| where timestamp > ago(1h)
+| where customDimensions["Dragonfire.IsError"] == "True"
+| project timestamp,
+          customDimensions["Dragonfire.ServiceName"],
+          customDimensions["Dragonfire.MethodName"],
+          customDimensions["Dragonfire.ErrorMessage"],
+          customDimensions["Dragonfire.ElapsedMs"]
+| order by timestamp desc
+
+// P95 latency per method
+traces
+| where isnotempty(customDimensions["Dragonfire.ElapsedMs"])
+| summarize p95 = percentile(todouble(customDimensions["Dragonfire.ElapsedMs"]), 95)
+    by tostring(customDimensions["Dragonfire.MethodName"])
+| order by p95 desc
+
+// All orders for a specific tenant — direct indexed lookup, no JSON parsing
+traces
+| where customDimensions["Request.TenantId"] == "acme-corp"
+| project timestamp,
+          customDimensions["Dragonfire.MethodName"],
+          customDimensions["Request.orderId"],
+          customDimensions["Response.Price"],
+          customDimensions["Dragonfire.ElapsedMs"]
+
+// HTTP 500 errors on a specific controller action
+traces
+| where customDimensions["Dragonfire.StatusCode"] == "500"
+    and customDimensions["Dragonfire.MethodName"] == "CreateOrder"
+| project timestamp,
+          customDimensions["Request.TenantId"],
+          customDimensions["Request.OrderRef"],
+          customDimensions["Dragonfire.ErrorMessage"]
+| order by timestamp desc
+
+// Slow requests (> 500 ms) across all services and controllers
+traces
+| where todouble(customDimensions["Dragonfire.ElapsedMs"]) > 500
+| project timestamp,
+          customDimensions["Dragonfire.ServiceName"],
+          customDimensions["Dragonfire.MethodName"],
+          customDimensions["Dragonfire.ElapsedMs"]
+| order by todouble(customDimensions["Dragonfire.ElapsedMs"]) desc
+```
+
+---
+
+## 9. Requirements
 
 | | Version |
 |---|---|
 | .NET | 8.0+ |
-| ASP.NET Core | 8.0+ (via `Microsoft.AspNetCore.App` framework reference) |
-| Roslyn (for generator) | 4.8+ (shipped with .NET 8 SDK) |
+| ASP.NET Core | 8.0+ (`Dragonfire.Logging.AspNetCore` only) |
+| Roslyn | 4.8+ (shipped with .NET 8 SDK) |
 
-**NuGet dependencies** (core package only):
+**Runtime dependencies:**
 
-```
-Microsoft.Extensions.Logging.Abstractions            8.0.2
-Microsoft.Extensions.DependencyInjection.Abstractions 8.0.2
-Newtonsoft.Json                                      13.0.3
-```
+| Package | Used by |
+|---|---|
+| `Microsoft.Extensions.Logging.Abstractions` | Core, Generator (generated code) |
+| `Microsoft.Extensions.DependencyInjection.Abstractions` | Core, Generator (generated DI helpers) |
 
-The `AspNetCore` package adds zero NuGet dependencies beyond a `FrameworkReference`. The `Generator` package adds zero runtime dependencies — `Microsoft.CodeAnalysis.CSharp` is `PrivateAssets="all"` and never flows to the consuming project.
+The `Generator` package has **zero runtime dependencies** — `Microsoft.CodeAnalysis.CSharp` is `PrivateAssets="all"` and never flows to the consuming project. The generated code depends only on `Microsoft.Extensions.Logging` and `Microsoft.Extensions.DependencyInjection`, which are already present in any .NET 8 application.
 
 ---
 
