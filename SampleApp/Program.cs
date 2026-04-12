@@ -1,3 +1,8 @@
+using Dragonfire.Logging.AspNetCore.Extensions;
+using Dragonfire.Logging.Generated;
+using SampleApp.Services;
+using Dragonfire.Logging.Extensions;
+
 namespace SampleApp
 {
     public class Program
@@ -8,6 +13,16 @@ namespace SampleApp
 
             // Add services to the container.
             builder.Services.AddControllersWithViews();
+
+            builder.Services.AddScoped<IOrderService, OrderService>();   // OrderService : ILoggable
+
+            builder.Logging.AddJsonConsole(o =>
+            {
+                o.IncludeScopes = true;
+                o.JsonWriterOptions = new System.Text.Json.JsonWriterOptions { Indented = true };
+            });
+
+            builder.Services.AddDragonfireGeneratedLogging();
 
             var app = builder.Build();
 
