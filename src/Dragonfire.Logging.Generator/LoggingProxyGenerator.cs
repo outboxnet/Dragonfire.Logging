@@ -218,6 +218,20 @@ namespace Dragonfire.Logging.Generator
                         }
                     }
 
+                    // Shared: runtime options (controls what is logged at runtime)
+                    try
+                    {
+                        spc.AddSource(
+                            "DragonfireGeneratedLoggingOptions.g.cs",
+                            SourceText.From(OptionsEmitter.Emit(), Encoding.UTF8));
+                    }
+                    catch (Exception ex)
+                    {
+                        var msg = $"Failed to emit logging options: {ex}";
+                        Console.Error.WriteLine($"[Dragonfire.Logging.Generator] {msg}");
+                        spc.ReportDiagnostic(Diagnostic.Create(s_generatorError, Location.None, msg));
+                    }
+
                     // Shared: scope state wrapper (fixes console formatter Message field)
                     try
                     {
@@ -556,11 +570,14 @@ namespace Dragonfire.Logging.Generator
 
         // ── Fields & constructor ──────────────────────────────────────────────
 
+        private const string OptionsFQN = "global::Dragonfire.Logging.Generated.DragonfireGeneratedLoggingOptions";
+
         private static void EmitFields(StringBuilder sb, ServiceModel model)
         {
             foreach (var iface in model.InterfacesFQN)
                 sb.AppendLine($"        private readonly {iface} {InnerField(iface)};");
             sb.AppendLine($"        private readonly {LoggerFQN(model)} _logger;");
+            sb.AppendLine($"        private readonly {OptionsFQN} _options;");
             sb.AppendLine();
         }
 
@@ -568,11 +585,13 @@ namespace Dragonfire.Logging.Generator
         {
             sb.AppendLine($"        public {model.ProxyClassName}(");
             sb.AppendLine($"            {model.PrimaryIfaceFQN} inner,");
-            sb.AppendLine($"            {LoggerFQN(model)} logger)");
+            sb.AppendLine($"            {LoggerFQN(model)} logger,");
+            sb.AppendLine($"            {OptionsFQN} options)");
             sb.AppendLine("        {");
             foreach (var iface in model.InterfacesFQN)
                 sb.AppendLine($"            {InnerField(iface)} = ({iface})inner;");
-            sb.AppendLine("            _logger = logger ?? throw new global::System.ArgumentNullException(nameof(logger));");
+            sb.AppendLine("            _logger  = logger  ?? throw new global::System.ArgumentNullException(nameof(logger));");
+            sb.AppendLine("            _options = options ?? new {OptionsFQN}();".Replace("{OptionsFQN}", OptionsFQN));
             sb.AppendLine("        }");
             sb.AppendLine();
         }
@@ -688,26 +707,38 @@ namespace Dragonfire.Logging.Generator
             sb.AppendLine($"{indent}__scope[\"Dragonfire.ServiceName\"] = \"{m.ClassName}\";");
             sb.AppendLine($"{indent}__scope[\"Dragonfire.MethodName\"]  = \"{method.Name}\";");
 
-            // ── Parameter-level [LogProperty] — direct capture ────────────────
-            foreach (var p in method.Parameters.Where(p => p.HasLogProperty && p.RefKind == RefKind.None))
-            {
-                var key = p.LogPropertyName ?? p.Name;
-                sb.AppendLine($"{indent}// [LogProperty(\"{key}\")] on parameter '{p.Name}'");
-                sb.AppendLine($"{indent}__scope[\"Request.{key}\"] = {p.Name};");
-            }
+            // ── Parameter-level [LogProperty] — guarded by options at runtime ──
+            var paramProps = method.Parameters
+                .Where(p => (p.HasLogProperty || !p.DtoLogProperties.IsEmpty) && p.RefKind == RefKind.None)
+                .ToList();
 
-            // ── DTO property-level [LogProperty] — direct property reads ──────
-            // Resolved entirely at compile time; no runtime reflection.
-            foreach (var p in method.Parameters.Where(p => !p.DtoLogProperties.IsEmpty && p.RefKind == RefKind.None))
+            if (paramProps.Count > 0)
             {
-                sb.AppendLine($"{indent}// [LogProperty] properties promoted from parameter '{p.Name}' ({p.TypeFQN})");
-                sb.AppendLine($"{indent}if ({p.Name} is not null)");
+                sb.AppendLine($"{indent}if (_options.LogRequestProperties)");
                 sb.AppendLine($"{indent}{{");
-                foreach (var dtoProp in p.DtoLogProperties)
+
+                foreach (var p in paramProps.Where(p => p.HasLogProperty))
                 {
-                    sb.AppendLine($"{indent}    // [LogProperty(\"{dtoProp.LogKey}\")] on {p.TypeFQN}.{dtoProp.PropertyName}");
-                    sb.AppendLine($"{indent}    __scope[\"Request.{dtoProp.LogKey}\"] = {p.Name}.{dtoProp.PropertyName};");
+                    var key = p.LogPropertyName ?? p.Name;
+                    sb.AppendLine($"{indent}    // [LogProperty(\"{key}\")] on parameter '{p.Name}'");
+                    sb.AppendLine($"{indent}    if (!_options.IsExcluded(\"{key}\"))");
+                    sb.AppendLine($"{indent}        __scope[\"Request.{key}\"] = {p.Name};");
                 }
+
+                foreach (var p in paramProps.Where(p => !p.DtoLogProperties.IsEmpty))
+                {
+                    sb.AppendLine($"{indent}    // [LogProperty] on {p.TypeFQN} properties");
+                    sb.AppendLine($"{indent}    if ({p.Name} is not null)");
+                    sb.AppendLine($"{indent}    {{");
+                    foreach (var dtoProp in p.DtoLogProperties)
+                    {
+                        sb.AppendLine($"{indent}        // [LogProperty(\"{dtoProp.LogKey}\")] on {p.TypeFQN}.{dtoProp.PropertyName}");
+                        sb.AppendLine($"{indent}        if (!_options.IsExcluded(\"{dtoProp.LogKey}\"))");
+                        sb.AppendLine($"{indent}            __scope[\"Request.{dtoProp.LogKey}\"] = {p.Name}.{dtoProp.PropertyName};");
+                    }
+                    sb.AppendLine($"{indent}    }}");
+                }
+
                 sb.AppendLine($"{indent}}}");
             }
         }
@@ -720,13 +751,14 @@ namespace Dragonfire.Logging.Generator
         {
             if (method.ResultTypeLogProperties.IsEmpty) return;
 
-            sb.AppendLine($"{indent}// [LogProperty] properties promoted from result type ({method.TaskResultTypeFQN ?? method.ReturnTypeFQN})");
-            sb.AppendLine($"{indent}if (__result is not null)");
+            sb.AppendLine($"{indent}// [LogProperty] on result type — guarded by options at runtime");
+            sb.AppendLine($"{indent}if (_options.LogResponseProperties && __result is not null)");
             sb.AppendLine($"{indent}{{");
             foreach (var rp in method.ResultTypeLogProperties)
             {
                 sb.AppendLine($"{indent}    // [LogProperty(\"{rp.LogKey}\")] on result.{rp.PropertyName}");
-                sb.AppendLine($"{indent}    __scope[\"Response.{rp.LogKey}\"] = __result.{rp.PropertyName};");
+                sb.AppendLine($"{indent}    if (!_options.IsExcluded(\"{rp.LogKey}\"))");
+                sb.AppendLine($"{indent}        __scope[\"Response.{rp.LogKey}\"] = __result.{rp.PropertyName};");
             }
             sb.AppendLine($"{indent}}}");
         }
@@ -735,12 +767,14 @@ namespace Dragonfire.Logging.Generator
 
         private static void EmitSuccessLog(StringBuilder sb, ServiceModel m, MethodModel method, string indent)
         {
-            var logMethod = LevelToLogMethod(method.LogAttr?.Level ?? WellKnown.DefaultLogLevel);
+            // Baked compile-time fallback level; overridden at runtime if _options.OverrideLevel is set
+            var bakedLevel = LevelToLogLevelEnum(method.LogAttr?.Level ?? WellKnown.DefaultLogLevel);
 
             sb.AppendLine($"{indent}__sw.Stop();");
             sb.AppendLine($"{indent}__scope[\"Dragonfire.ElapsedMs\"] = __sw.Elapsed.TotalMilliseconds;");
             sb.AppendLine($"{indent}using (_logger.BeginScope(__scope))");
-            sb.AppendLine($"{indent}    _logger.{logMethod}(");
+            sb.AppendLine($"{indent}    _logger.Log(");
+            sb.AppendLine($"{indent}        _options.OverrideLevel ?? {bakedLevel},");
             sb.AppendLine($"{indent}        \"[Dragonfire] {{Dragonfire_ServiceName}}.{{Dragonfire_MethodName}} completed in {{Dragonfire_ElapsedMs}}ms\",");
             sb.AppendLine($"{indent}        \"{m.ClassName}\", \"{method.Name}\", __sw.Elapsed.TotalMilliseconds);");
         }
@@ -753,9 +787,12 @@ namespace Dragonfire.Logging.Generator
             sb.AppendLine($"{indent}    __scope[\"Dragonfire.ElapsedMs\"]    = __sw.Elapsed.TotalMilliseconds;");
             sb.AppendLine($"{indent}    __scope[\"Dragonfire.IsError\"]      = true;");
             sb.AppendLine($"{indent}    __scope[\"Dragonfire.ErrorMessage\"] = __ex.Message;");
-            sb.AppendLine($"{indent}    __scope[\"Dragonfire.StackTrace\"]   = __ex.StackTrace;");
+            sb.AppendLine($"{indent}    if (_options.LogStackTrace)");
+            sb.AppendLine($"{indent}        __scope[\"Dragonfire.StackTrace\"] = __ex.StackTrace;");
             sb.AppendLine($"{indent}    using (_logger.BeginScope(__scope))");
-            sb.AppendLine($"{indent}        _logger.LogError(__ex,");
+            sb.AppendLine($"{indent}        _logger.Log(");
+            sb.AppendLine($"{indent}            _options.OverrideLevel ?? global::Microsoft.Extensions.Logging.LogLevel.Error,");
+            sb.AppendLine($"{indent}            __ex,");
             sb.AppendLine($"{indent}            \"[Dragonfire] {{Dragonfire_ServiceName}}.{{Dragonfire_MethodName}} FAILED in {{Dragonfire_ElapsedMs}}ms \\u2014 {{Dragonfire_ErrorMessage}}\",");
             sb.AppendLine($"{indent}            \"{m.ClassName}\", \"{method.Name}\", __sw.Elapsed.TotalMilliseconds, __ex.Message);");
             sb.AppendLine($"{indent}    throw;");
@@ -764,14 +801,14 @@ namespace Dragonfire.Logging.Generator
 
         // ── Helpers ───────────────────────────────────────────────────────────
 
-        private static string LevelToLogMethod(string level) => level switch
+        private static string LevelToLogLevelEnum(string level) => level switch
         {
-            "Trace"    => "LogTrace",
-            "Debug"    => "LogDebug",
-            "Warning"  => "LogWarning",
-            "Error"    => "LogError",
-            "Critical" => "LogCritical",
-            _          => "LogInformation"
+            "Trace"    => "global::Microsoft.Extensions.Logging.LogLevel.Trace",
+            "Debug"    => "global::Microsoft.Extensions.Logging.LogLevel.Debug",
+            "Warning"  => "global::Microsoft.Extensions.Logging.LogLevel.Warning",
+            "Error"    => "global::Microsoft.Extensions.Logging.LogLevel.Error",
+            "Critical" => "global::Microsoft.Extensions.Logging.LogLevel.Critical",
+            _          => "global::Microsoft.Extensions.Logging.LogLevel.Information"
         };
 
         private static string FormatParam(ParameterModel p)
@@ -792,6 +829,70 @@ namespace Dragonfire.Logging.Generator
         {
             var parts = ifaceFQN.Split('.');
             return "_inner" + parts[parts.Length - 1].Replace(">", "").Replace("<", "");
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Runtime options emitter
+    //
+    // Generates DragonfireGeneratedLoggingOptions — a plain options class that
+    // is registered as a singleton and injected into every proxy constructor.
+    // Allows callers to configure logging behaviour without recompiling.
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    internal static class OptionsEmitter
+    {
+        public static string Emit()
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("// <auto-generated/>");
+            sb.AppendLine("// Generated by Dragonfire.Logging.Generator");
+            sb.AppendLine("#nullable enable");
+            sb.AppendLine();
+            sb.AppendLine("namespace Dragonfire.Logging.Generated");
+            sb.AppendLine("{");
+            sb.AppendLine("    /// <summary>");
+            sb.AppendLine("    /// Runtime options for all Dragonfire compile-time logging proxies.");
+            sb.AppendLine("    /// Register via <c>services.AddDragonfireGeneratedLogging(opt => { ... })</c>.");
+            sb.AppendLine("    /// </summary>");
+            sb.AppendLine("    [global::System.CodeDom.Compiler.GeneratedCode(\"Dragonfire.Logging.Generator\", \"1.0.0\")]");
+            sb.AppendLine("    public sealed class DragonfireGeneratedLoggingOptions");
+            sb.AppendLine("    {");
+            sb.AppendLine("        /// <summary>");
+            sb.AppendLine("        /// Promote Request.* properties to scope ([LogProperty] on parameters). Default: <c>true</c>.");
+            sb.AppendLine("        /// </summary>");
+            sb.AppendLine("        public bool LogRequestProperties { get; set; } = true;");
+            sb.AppendLine();
+            sb.AppendLine("        /// <summary>");
+            sb.AppendLine("        /// Promote Response.* properties to scope ([LogProperty] on return type). Default: <c>true</c>.");
+            sb.AppendLine("        /// </summary>");
+            sb.AppendLine("        public bool LogResponseProperties { get; set; } = true;");
+            sb.AppendLine();
+            sb.AppendLine("        /// <summary>");
+            sb.AppendLine("        /// Include <c>Dragonfire.StackTrace</c> in the error scope. Disable to reduce log size. Default: <c>true</c>.");
+            sb.AppendLine("        /// </summary>");
+            sb.AppendLine("        public bool LogStackTrace { get; set; } = true;");
+            sb.AppendLine();
+            sb.AppendLine("        /// <summary>");
+            sb.AppendLine("        /// Scope keys to suppress, matched case-insensitively against the bare property name");
+            sb.AppendLine("        /// (without the <c>Request.</c> / <c>Response.</c> prefix).");
+            sb.AppendLine("        /// Example: <c>\"Password\"</c> suppresses both <c>Request.Password</c> and <c>Response.Password</c>.");
+            sb.AppendLine("        /// </summary>");
+            sb.AppendLine("        public global::System.Collections.Generic.ISet<string> ExcludeProperties { get; set; }");
+            sb.AppendLine("            = new global::System.Collections.Generic.HashSet<string>(global::System.StringComparer.OrdinalIgnoreCase);");
+            sb.AppendLine();
+            sb.AppendLine("        /// <summary>");
+            sb.AppendLine("        /// Overrides the success log level for all methods, regardless of the <c>[Log(Level = ...)]</c> attribute.");
+            sb.AppendLine("        /// <c>null</c> = use the per-method attribute value (default).");
+            sb.AppendLine("        /// Error logs always use <c>LogLevel.Error</c> regardless of this setting.");
+            sb.AppendLine("        /// </summary>");
+            sb.AppendLine("        public global::Microsoft.Extensions.Logging.LogLevel? OverrideLevel { get; set; }");
+            sb.AppendLine();
+            sb.AppendLine("        /// <summary>Returns <c>true</c> when <paramref name=\"bareKey\"/> is in <see cref=\"ExcludeProperties\"/>.</summary>");
+            sb.AppendLine("        internal bool IsExcluded(string bareKey) => ExcludeProperties.Contains(bareKey);");
+            sb.AppendLine("    }");
+            sb.AppendLine("}");
+            return sb.ToString();
         }
     }
 
@@ -883,12 +984,18 @@ namespace Dragonfire.Logging.Generator
             sb.AppendLine("    {");
 
             sb.AppendLine($"        public static {WellKnown.IServiceCollection} AddDragonfireGeneratedLogging(");
-            sb.AppendLine($"            this {WellKnown.IServiceCollection} services)");
+            sb.AppendLine($"            this {WellKnown.IServiceCollection} services,");
+            sb.AppendLine($"            global::System.Action<global::Dragonfire.Logging.Generated.DragonfireGeneratedLoggingOptions>? configure = null)");
             sb.AppendLine("        {");
+            sb.AppendLine("            var __options = new global::Dragonfire.Logging.Generated.DragonfireGeneratedLoggingOptions();");
+            sb.AppendLine("            configure?.Invoke(__options);");
+            sb.AppendLine("            services.AddSingleton(__options);");
+            sb.AppendLine();
 
             foreach (var model in models)
             {
                 var loggerFQN = $"global::Microsoft.Extensions.Logging.ILogger<{model.ClassFQN}>";
+                var optionsFQN = "global::Dragonfire.Logging.Generated.DragonfireGeneratedLoggingOptions";
 
                 foreach (var iface in model.InterfacesFQN)
                 {
@@ -898,7 +1005,8 @@ namespace Dragonfire.Logging.Generator
                     sb.AppendLine($"                typeof({iface}),");
                     sb.AppendLine($"                (inner, sp) => new {model.ProxyFQN}(");
                     sb.AppendLine($"                    ({iface})inner,");
-                    sb.AppendLine($"                    sp.GetRequiredService<{loggerFQN}>()));");
+                    sb.AppendLine($"                    sp.GetRequiredService<{loggerFQN}>(),");
+                    sb.AppendLine($"                    sp.GetRequiredService<{optionsFQN}>()));");
                     sb.AppendLine();
                 }
             }
