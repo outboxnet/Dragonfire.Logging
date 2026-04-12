@@ -179,6 +179,20 @@ namespace Dragonfire.Logging.Services
                 }
             }
 
+            // ── [LogProperty]-promoted fields — emitted without prefix ────────
+            // These are user-named, first-class dimensions surfaced directly as:
+            //   customDimensions["TenantId"], customDimensions["CustomerId"], …
+            // No Dragonfire.* prefix so KQL queries stay concise:
+            //   | where customDimensions["TenantId"] == "acme"
+            if (entry.NamedProperties is { Count: > 0 })
+            {
+                foreach (var (key, value) in entry.NamedProperties)
+                {
+                    if (value is not null && !string.IsNullOrWhiteSpace(key))
+                        scope[key] = value;
+                }
+            }
+
             return scope;
         }
 

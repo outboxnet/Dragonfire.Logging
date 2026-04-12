@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Text;
 using System.Threading.Tasks;
 using Dragonfire.Logging.AspNetCore.Configuration;
@@ -12,6 +13,7 @@ using Dragonfire.Logging.Models;
 using Dragonfire.Logging.Services;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.Controllers;
 using Microsoft.AspNetCore.Mvc.Filters;
 using Microsoft.Extensions.Logging;
 
@@ -30,15 +32,26 @@ namespace Dragonfire.Logging.AspNetCore.Filters
     ///
     /// Registered at <c>int.MinValue</c> order so it wraps all other filters
     /// and measures total action elapsed time accurately.
+    ///
+    /// <b>[LogProperty] support:</b>
+    /// Action parameters decorated with <c>[LogProperty]</c> and properties on any
+    /// action-argument DTO decorated with <c>[LogProperty]</c> are promoted to
+    /// individual structured-log scope entries (e.g. <c>customDimensions["TenantId"]</c>).
+    ///
+    /// <b>Depth control:</b>
+    /// By default only 1 level of nesting is serialised. Nested objects become
+    /// <c>[N fields]</c> and arrays become <c>[N items]</c>. Override per endpoint
+    /// via <c>[Log(MaxDepth = 0)]</c> (unlimited) or globally via
+    /// <see cref="DragonfireLoggingOptions.DefaultMaxDepth"/>.
     /// </summary>
     public sealed class DragonfireLoggingFilter : IAsyncActionFilter
     {
         private const string CorrelationIdHeader = "X-Correlation-ID";
 
-        private readonly IDragonfireLoggingService _loggingService;
-        private readonly ILogFilterService _filterService;
-        private readonly DragonfireLoggingOptions _coreOptions;
-        private readonly DragonfireAspNetCoreOptions _httpOptions;
+        private readonly IDragonfireLoggingService       _loggingService;
+        private readonly ILogFilterService               _filterService;
+        private readonly DragonfireLoggingOptions        _coreOptions;
+        private readonly DragonfireAspNetCoreOptions     _httpOptions;
         private readonly ILogger<DragonfireLoggingFilter> _logger;
 
         public DragonfireLoggingFilter(
@@ -67,6 +80,7 @@ namespace Dragonfire.Logging.AspNetCore.Filters
 
             var attr          = ResolveLogAttribute(context);
             var correlationId = EnsureCorrelationId(context.HttpContext);
+            var maxDepth      = ResolveMaxDepth(attr);
 
             var entry = new LogEntry
             {
@@ -87,7 +101,10 @@ namespace Dragonfire.Logging.AspNetCore.Filters
             entry.CustomData = ctx.CustomData.Count > 0 ? new Dictionary<string, object>(ctx.CustomData) : null;
 
             if (_httpOptions.EnableRequestLogging && attr?.LogRequest != false)
-                entry.RequestData = await BuildRequestDataAsync(context, attr);
+                entry.RequestData = await BuildRequestDataAsync(context, attr, maxDepth);
+
+            // Extract [LogProperty] from action parameters and argument objects (before execution).
+            ExtractArgumentNamedProperties(entry, context);
 
             // ── Execute the action ────────────────────────────────────────────
             var sw      = Stopwatch.StartNew();
@@ -105,9 +122,15 @@ namespace Dragonfire.Logging.AspNetCore.Filters
                 if (_coreOptions.IncludeStackTraceOnError)
                     entry.StackTrace = ex.StackTrace;
             }
+            else if (_httpOptions.EnableResponseLogging && attr?.LogResponse != false)
+            {
+                // Build filtered response payload.
+                entry.ResponseData = BuildResponseData(executed, attr, maxDepth);
 
-            if (_httpOptions.EnableResponseLogging && attr?.LogResponse != false)
-                entry.ResponseData = BuildResponseData(executed, attr);
+                // Extract [LogProperty] from response DTO properties.
+                if (executed.Result is ObjectResult { Value: not null } objResult)
+                    MergeIntoNamedProperties(entry, _filterService.ExtractNamedProperties(objResult.Value));
+            }
 
             if (_httpOptions.LogValidationErrors && attr?.LogValidationErrors != false
                 && !context.ModelState.IsValid)
@@ -144,7 +167,17 @@ namespace Dragonfire.Logging.AspNetCore.Filters
             return id;
         }
 
-        private async Task<object?> BuildRequestDataAsync(ActionExecutingContext context, LogAttribute? attr)
+        /// <summary>
+        /// Resolves effective max depth: attribute-level (when ≥ 0) takes precedence
+        /// over <see cref="DragonfireLoggingOptions.DefaultMaxDepth"/>.
+        /// </summary>
+        private int ResolveMaxDepth(LogAttribute? attr)
+            => (attr is not null && attr.MaxDepth >= 0)
+                ? attr.MaxDepth
+                : _coreOptions.DefaultMaxDepth;
+
+        private async Task<object?> BuildRequestDataAsync(
+            ActionExecutingContext context, LogAttribute? attr, int maxDepth)
         {
             var data      = new Dictionary<string, object?>();
             var maxLength = attr?.MaxContentLength ?? _coreOptions.DefaultMaxContentLength;
@@ -155,14 +188,16 @@ namespace Dragonfire.Logging.AspNetCore.Filters
                     context.ActionArguments,
                     attr?.ExcludeProperties,
                     attr?.IncludeProperties,
-                    maxLength);
+                    maxLength,
+                    maxDepth);
             }
 
             var req = context.HttpContext.Request;
             if (!HttpMethods.IsGet(req.Method) && req.ContentLength > 0)
             {
                 req.EnableBuffering();
-                var body = await new StreamReader(req.Body, Encoding.UTF8, leaveOpen: true).ReadToEndAsync();
+                var body = await new StreamReader(req.Body, Encoding.UTF8, leaveOpen: true)
+                    .ReadToEndAsync();
                 req.Body.Position = 0;
 
                 if (!string.IsNullOrEmpty(body))
@@ -187,7 +222,7 @@ namespace Dragonfire.Logging.AspNetCore.Filters
             return data.Count > 0 ? data : null;
         }
 
-        private object? BuildResponseData(ActionExecutedContext context, LogAttribute? attr)
+        private object? BuildResponseData(ActionExecutedContext context, LogAttribute? attr, int maxDepth)
         {
             if (context.Result is not ObjectResult { Value: not null } objectResult)
                 return null;
@@ -196,7 +231,64 @@ namespace Dragonfire.Logging.AspNetCore.Filters
                 objectResult.Value,
                 attr?.ExcludeProperties,
                 attr?.IncludeProperties,
-                attr?.MaxContentLength ?? _coreOptions.DefaultMaxContentLength);
+                attr?.MaxContentLength ?? _coreOptions.DefaultMaxContentLength,
+                maxDepth);
+        }
+
+        // ── [LogProperty] extraction ─────────────────────────────────────────
+
+        /// <summary>
+        /// Populates <see cref="LogEntry.NamedProperties"/> from:
+        /// <list type="number">
+        ///   <item>Action method parameters decorated with <c>[LogProperty]</c>.</item>
+        ///   <item>Properties on each action-argument DTO decorated with <c>[LogProperty]</c>.</item>
+        /// </list>
+        /// </summary>
+        private void ExtractArgumentNamedProperties(LogEntry entry, ActionExecutingContext context)
+        {
+            var named = entry.NamedProperties
+                        ?? new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+
+            // 1. Parameter-level [LogProperty] — available via ControllerActionDescriptor.
+            if (context.ActionDescriptor is ControllerActionDescriptor cad)
+            {
+                foreach (var param in cad.MethodInfo.GetParameters())
+                {
+                    var logProp = param.GetCustomAttribute<LogPropertyAttribute>();
+                    if (logProp is null) continue;
+
+                    var key = logProp.Name ?? param.Name ?? $"param{param.Position}";
+                    if (param.Name is not null
+                        && context.ActionArguments.TryGetValue(param.Name, out var argValue))
+                    {
+                        named.TryAdd(key, argValue);
+                    }
+                }
+            }
+
+            // 2. Property-level [LogProperty] on each argument object.
+            foreach (var arg in context.ActionArguments.Values)
+                MergeDict(named, _filterService.ExtractNamedProperties(arg));
+
+            if (named.Count > 0)
+                entry.NamedProperties = named;
+        }
+
+        private static void MergeIntoNamedProperties(LogEntry entry, Dictionary<string, object?> source)
+        {
+            if (source.Count == 0) return;
+            var named = entry.NamedProperties
+                        ?? new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+            MergeDict(named, source);
+            entry.NamedProperties = named;
+        }
+
+        private static void MergeDict(
+            Dictionary<string, object?> target,
+            Dictionary<string, object?> source)
+        {
+            foreach (var (k, v) in source)
+                target.TryAdd(k, v);
         }
     }
 }

@@ -35,6 +35,19 @@ namespace Dragonfire.Logging.Configuration
         /// </summary>
         public int DefaultMaxContentLength { get; set; } = 10_000;
 
+        /// <summary>
+        /// Default maximum nesting depth for serialised payloads (request, response,
+        /// method arguments, return values). Can be overridden per method via
+        /// <see cref="Attributes.LogAttribute.MaxDepth"/>.
+        /// <list type="bullet">
+        ///   <item><c>0</c> — unlimited (full serialisation).</item>
+        ///   <item><c>1</c> (default) — top-level scalars only; nested objects/arrays become
+        ///   <c>[N fields]</c> / <c>[N items]</c> to keep logs concise.</item>
+        ///   <item><c>N</c> — N levels of nesting.</item>
+        /// </list>
+        /// </summary>
+        public int DefaultMaxDepth { get; set; } = 1;
+
         /// <summary>Include the full stack trace in error log entries. Default: <c>true</c>.</summary>
         public bool IncludeStackTraceOnError { get; set; } = true;
 

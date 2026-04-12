@@ -1,6 +1,10 @@
 using System;
+using System.Collections;
+using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using System.Text.RegularExpressions;
+using Dragonfire.Logging.Attributes;
 using Dragonfire.Logging.Models;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
@@ -13,8 +17,8 @@ namespace Dragonfire.Logging.Services
         private static readonly JsonSerializerSettings SerializerSettings = new()
         {
             ReferenceLoopHandling = ReferenceLoopHandling.Ignore,
-            MaxDepth = 10,
-            NullValueHandling = NullValueHandling.Ignore
+            MaxDepth              = 32,
+            NullValueHandling     = NullValueHandling.Ignore
         };
 
         private readonly SensitiveDataPolicy _policy;
@@ -29,18 +33,22 @@ namespace Dragonfire.Logging.Services
             object? data,
             string[]? excludeProperties = null,
             string[]? includeProperties = null,
-            int maxLength = 0)
+            int maxLength = 0,
+            int maxDepth  = 0)
         {
             if (data is null) return null;
 
             try
             {
-                var json = JsonConvert.SerializeObject(data, SerializerSettings);
+                var json  = JsonConvert.SerializeObject(data, SerializerSettings);
                 var token = JToken.Parse(json);
 
-                FilterToken(token,
+                FilterToken(
+                    token,
                     excludeProperties ?? Array.Empty<string>(),
-                    includeProperties ?? Array.Empty<string>());
+                    includeProperties ?? Array.Empty<string>(),
+                    maxDepth,
+                    currentDepth: 0);
 
                 var result = token.ToString(Formatting.None);
 
@@ -48,8 +56,7 @@ namespace Dragonfire.Logging.Services
                     result = result[..maxLength] + "...[TRUNCATED]";
 
                 // Deserialise without a target type — returns JObject/JArray/primitive.
-                // This avoids type-cast failures for anonymous types, object[], etc.
-                // and lets structured-logging sinks (Serilog, etc.) handle it natively.
+                // Avoids type-cast failures for anonymous types, object[], etc.
                 return JsonConvert.DeserializeObject(result);
             }
             catch
@@ -83,44 +90,96 @@ namespace Dragonfire.Logging.Services
             return true;
         }
 
+        /// <inheritdoc/>
+        public Dictionary<string, object?> ExtractNamedProperties(object? data)
+        {
+            var result = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+            if (data is null) return result;
+
+            ExtractFromObject(data, result);
+            return result;
+        }
+
         // ── Private helpers ──────────────────────────────────────────────────
 
-        private void FilterToken(JToken token, string[] exclude, string[] include)
+        /// <summary>
+        /// Recursively filters <paramref name="token"/> in-place:
+        /// <list type="bullet">
+        ///   <item>Removes excluded / sensitive properties from objects.</item>
+        ///   <item>Applies pattern-based redaction to strings.</item>
+        ///   <item>When <paramref name="maxDepth"/> &gt; 0 and <paramref name="currentDepth"/>
+        ///   reaches the limit, replaces nested objects with <c>[N fields]</c> and arrays
+        ///   with <c>[N items]</c>.</item>
+        /// </list>
+        /// </summary>
+        private void FilterToken(
+            JToken token,
+            string[] exclude,
+            string[] include,
+            int      maxDepth,
+            int      currentDepth)
         {
             switch (token.Type)
             {
+                // ── Object ────────────────────────────────────────────────────
                 case JTokenType.Object:
+                {
+                    // Depth limit reached — replace this object with a placeholder.
+                    if (maxDepth > 0 && currentDepth >= maxDepth)
+                    {
+                        var fieldCount = ((JObject)token).Count;
+                        token.Replace(new JValue($"[{fieldCount} fields]"));
+                        return;
+                    }
+
                     var obj = (JObject)token;
 
-                    // Remove properties that fail the include/exclude check or are sensitive fields.
+                    // Remove properties that fail include/exclude or are sensitive.
                     var toRemove = obj.Properties()
-                        .Where(p => !ShouldLogProperty(p.Name, exclude, include)
-                                    || _policy.SensitiveFields.Contains(p.Name))
+                        .Where(p =>
+                            !ShouldLogProperty(p.Name, exclude, include)
+                            || _policy.SensitiveFields.Contains(p.Name, StringComparer.OrdinalIgnoreCase))
                         .ToList();
 
                     foreach (var prop in toRemove)
                         prop.Remove();
 
-                    // Recurse into remaining properties.
-                    foreach (var prop in obj.Properties())
-                        FilterToken(prop.Value, exclude, include);
+                    // Recurse into surviving properties.
+                    foreach (var prop in obj.Properties().ToList())
+                        FilterToken(prop.Value, exclude, include, maxDepth, currentDepth + 1);
 
                     break;
+                }
 
+                // ── Array ─────────────────────────────────────────────────────
                 case JTokenType.Array:
-                    foreach (var item in token.Children())
-                        FilterToken(item, exclude, include);
-                    break;
+                {
+                    // Depth limit reached — replace this array with a placeholder.
+                    if (maxDepth > 0 && currentDepth >= maxDepth)
+                    {
+                        var itemCount = ((JArray)token).Count;
+                        token.Replace(new JValue($"[{itemCount} items]"));
+                        return;
+                    }
 
+                    foreach (var item in token.Children().ToList())
+                        FilterToken(item, exclude, include, maxDepth, currentDepth + 1);
+
+                    break;
+                }
+
+                // ── String — apply pattern-based redaction ────────────────────
                 case JTokenType.String:
+                {
                     var str = token.Value<string>();
                     if (!string.IsNullOrEmpty(str))
                     {
                         var redacted = ApplyPatternRedaction(str);
-                        if (redacted != str)
-                            token.Replace(redacted);
+                        if (!ReferenceEquals(redacted, str))
+                            token.Replace(new JValue(redacted));
                     }
                     break;
+                }
             }
         }
 
@@ -142,6 +201,56 @@ namespace Dragonfire.Logging.Services
                     "[PHONE_REDACTED]");
 
             return result;
+        }
+
+        // ── [LogProperty] extraction ─────────────────────────────────────────
+
+        /// <summary>
+        /// Scans <paramref name="data"/> for <c>[LogProperty]</c>-decorated properties.
+        /// If <paramref name="data"/> is a non-string <see cref="IEnumerable"/>, each
+        /// element is scanned (first-level elements only).
+        /// </summary>
+        private static void ExtractFromObject(object data, Dictionary<string, object?> result)
+        {
+            var type = data.GetType();
+
+            // Skip scalars — they can't carry [LogProperty] attributes.
+            if (IsSimpleType(type)) return;
+
+            // For non-string collections scan each element.
+            if (data is IEnumerable enumerable)
+            {
+                foreach (var item in enumerable)
+                    if (item is not null)
+                        ExtractFromObject(item, result);
+                return;
+            }
+
+            // Reflect over public instance properties.
+            foreach (var prop in type.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+            {
+                var attr = prop.GetCustomAttribute<LogPropertyAttribute>();
+                if (attr is null) continue;
+
+                var key = attr.Name ?? prop.Name;
+                try   { result.TryAdd(key, prop.GetValue(data)); }
+                catch { result.TryAdd(key, "[UNREADABLE]"); }
+            }
+        }
+
+        private static bool IsSimpleType(Type type)
+        {
+            if (type.IsPrimitive || type.IsEnum) return true;
+
+            var underlying = Nullable.GetUnderlyingType(type);
+            if (underlying is not null) return IsSimpleType(underlying);
+
+            return type == typeof(string)
+                || type == typeof(decimal)
+                || type == typeof(Guid)
+                || type == typeof(DateTime)
+                || type == typeof(DateTimeOffset)
+                || type == typeof(TimeSpan);
         }
     }
 }

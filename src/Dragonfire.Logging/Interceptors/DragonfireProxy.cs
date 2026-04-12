@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
@@ -57,14 +58,26 @@ namespace Dragonfire.Logging.Interceptors
     //     InterceptAsyncWithResult<TResult> based on the return type.
     //   • TargetInvocationException (thrown by MethodInfo.Invoke when the target
     //     method throws) is always unwrapped so callers see the original exception.
+    //
+    // [LogProperty] support:
+    //   • Parameters decorated with [LogProperty] are extracted directly from args.
+    //   • DTO properties decorated with [LogProperty] are extracted via reflection
+    //     on each argument object and on the return value.
+    //   • All promoted values land in LogEntry.NamedProperties and are emitted as
+    //     individual scope entries (no Dragonfire.* prefix — clean KQL keys).
+    //
+    // Depth control:
+    //   • ResolveMaxDepth() picks the effective depth from [LogAttribute].MaxDepth
+    //     (when >= 0) or DragonfireLoggingOptions.DefaultMaxDepth.
+    //   • The resolved depth is forwarded to every FilterData() call.
     // ────────────────────────────────────────────────────────────────────────────
     internal class DragonfireProxy<T> : DispatchProxy where T : class
     {
         // Fields are set by Wrap() immediately after DispatchProxy.Create.
-        private T                        _inner          = null!;
-        private IDragonfireLoggingService _loggingService = null!;
-        private ILogFilterService         _filterService  = null!;
-        private DragonfireLoggingOptions  _options        = null!;
+        private T                         _inner          = null!;
+        private IDragonfireLoggingService  _loggingService = null!;
+        private ILogFilterService          _filterService  = null!;
+        private DragonfireLoggingOptions   _options        = null!;
 
         // Cache: Task result-type → closed generic InterceptAsyncWithResult<TResult>.
         // Static per closed generic DragonfireProxy<T>, so shared across all proxy
@@ -124,18 +137,22 @@ namespace Dragonfire.Logging.Interceptors
 
         private object? InterceptSync(MethodInfo method, object?[]? args)
         {
-            var attr  = ResolveAttribute(method);
-            var entry = BuildEntry(method, args, attr);
-            var sw    = Stopwatch.StartNew();
-            object? result = null;
+            var attr     = ResolveAttribute(method);
+            var maxDepth = ResolveMaxDepth(attr);
+            var entry    = BuildEntry(method, args, attr, maxDepth);
+            var sw       = Stopwatch.StartNew();
 
             try
             {
-                result = CallTarget(method, args);
+                var result = CallTarget(method, args);
 
                 if (result is not null && method.ReturnType != typeof(void))
+                {
                     entry.MethodResult = _filterService.FilterData(
-                        result, Excl(attr), Incl(attr), MaxLen(attr));
+                        result, Excl(attr), Incl(attr), MaxLen(attr), maxDepth);
+
+                    ExtractResultNamedProperties(entry, result);
+                }
 
                 return result;
             }
@@ -148,18 +165,17 @@ namespace Dragonfire.Logging.Interceptors
             {
                 sw.Stop();
                 entry.ElapsedMilliseconds = sw.ElapsedMilliseconds;
-                // Logging service is effectively sync (ILogger.Log + optional callback).
-                // Fire-and-observe: if LogAsync were truly async we still want to
-                // proceed — business logic must not block on logging.
+                // ILogger.Log is synchronous — no blocking concern here.
                 _loggingService.Log(entry);
             }
         }
 
         private async Task InterceptAsync(MethodInfo method, object?[]? args)
         {
-            var attr  = ResolveAttribute(method);
-            var entry = BuildEntry(method, args, attr);
-            var sw    = Stopwatch.StartNew();
+            var attr     = ResolveAttribute(method);
+            var maxDepth = ResolveMaxDepth(attr);
+            var entry    = BuildEntry(method, args, attr, maxDepth);
+            var sw       = Stopwatch.StartNew();
 
             try
             {
@@ -181,14 +197,24 @@ namespace Dragonfire.Logging.Interceptors
         // Called via reflection for Task<TResult> methods.
         private async Task<TResult> InterceptAsyncWithResult<TResult>(MethodInfo method, object?[]? args)
         {
-            var attr  = ResolveAttribute(method);
-            var entry = BuildEntry(method, args, attr);
-            var sw    = Stopwatch.StartNew();
-            TResult result;
+            var attr     = ResolveAttribute(method);
+            var maxDepth = ResolveMaxDepth(attr);
+            var entry    = BuildEntry(method, args, attr, maxDepth);
+            var sw       = Stopwatch.StartNew();
+
+            // default! is safe: if an exception is thrown, return is never reached.
+            TResult result = default!;
 
             try
             {
                 result = await ((Task<TResult>)CallTarget(method, args)!).ConfigureAwait(false);
+
+                // Capture result and named properties on the success path,
+                // BEFORE the finally block logs the entry.
+                entry.MethodResult = _filterService.FilterData(
+                    result, Excl(attr), Incl(attr), MaxLen(attr), maxDepth);
+
+                ExtractResultNamedProperties(entry, result);
             }
             catch (Exception ex)
             {
@@ -201,10 +227,6 @@ namespace Dragonfire.Logging.Interceptors
                 entry.ElapsedMilliseconds = sw.ElapsedMilliseconds;
                 await _loggingService.LogAsync(entry).ConfigureAwait(false);
             }
-
-            // Capture result only on success (outside finally) so errors aren't serialised.
-            entry.MethodResult = _filterService.FilterData(
-                result, Excl(attr), Incl(attr), MaxLen(attr));
 
             return result;
         }
@@ -230,7 +252,7 @@ namespace Dragonfire.Logging.Interceptors
             }
         }
 
-        private LogEntry BuildEntry(MethodInfo method, object?[]? args, LogAttribute? attr)
+        private LogEntry BuildEntry(MethodInfo method, object?[]? args, LogAttribute? attr, int maxDepth)
         {
             var entry = new LogEntry
             {
@@ -241,8 +263,13 @@ namespace Dragonfire.Logging.Interceptors
             };
 
             if (args is { Length: > 0 })
+            {
                 entry.MethodArguments = _filterService.FilterData(
-                    args, Excl(attr), Incl(attr), MaxLen(attr));
+                    args, Excl(attr), Incl(attr), MaxLen(attr), maxDepth);
+
+                // Extract [LogProperty] from parameter declarations and argument objects.
+                ExtractArgumentNamedProperties(entry, method, args);
+            }
 
             return entry;
         }
@@ -256,12 +283,82 @@ namespace Dragonfire.Logging.Interceptors
                 entry.StackTrace = ex.StackTrace;
         }
 
+        // ── [LogProperty] extraction ─────────────────────────────────────────
+
+        /// <summary>
+        /// Collects named properties from:
+        /// <list type="number">
+        ///   <item>Method parameters decorated with <c>[LogProperty]</c> — value taken directly from <paramref name="args"/>.</item>
+        ///   <item>Properties on each argument object decorated with <c>[LogProperty]</c>.</item>
+        /// </list>
+        /// Results are merged into <see cref="LogEntry.NamedProperties"/>.
+        /// </summary>
+        private void ExtractArgumentNamedProperties(LogEntry entry, MethodInfo method, object?[]? args)
+        {
+            if (args is null || args.Length == 0) return;
+
+            var named = entry.NamedProperties
+                        ?? new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+
+            // 1. Parameter-level [LogProperty]
+            var parameters = method.GetParameters();
+            for (int i = 0; i < parameters.Length && i < args.Length; i++)
+            {
+                var logProp = parameters[i].GetCustomAttribute<LogPropertyAttribute>();
+                if (logProp is null) continue;
+
+                var key = logProp.Name ?? parameters[i].Name ?? $"param{i}";
+                named.TryAdd(key, args[i]);
+            }
+
+            // 2. Property-level [LogProperty] on each argument object
+            foreach (var arg in args)
+            {
+                foreach (var (k, v) in _filterService.ExtractNamedProperties(arg))
+                    named.TryAdd(k, v);
+            }
+
+            if (named.Count > 0)
+                entry.NamedProperties = named;
+        }
+
+        /// <summary>
+        /// Merges <c>[LogProperty]</c>-decorated properties from the method return value
+        /// into <see cref="LogEntry.NamedProperties"/>. Called only on the success path.
+        /// </summary>
+        private void ExtractResultNamedProperties(LogEntry entry, object? result)
+        {
+            if (result is null) return;
+
+            var extracted = _filterService.ExtractNamedProperties(result);
+            if (extracted.Count == 0) return;
+
+            var named = entry.NamedProperties
+                        ?? new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var (k, v) in extracted)
+                named.TryAdd(k, v);
+
+            entry.NamedProperties = named;
+        }
+
+        // ── Attribute / option resolution ────────────────────────────────────
+
         private LogAttribute? ResolveAttribute(MethodInfo method)
             => (LogAttribute?)method.GetCustomAttributes(typeof(LogAttribute), true).FirstOrDefault()
                ?? (LogAttribute?)typeof(T).GetCustomAttributes(typeof(LogAttribute), true).FirstOrDefault();
 
-        private static string[] Excl(LogAttribute? a) => a?.ExcludeProperties ?? Array.Empty<string>();
-        private static string[] Incl(LogAttribute? a) => a?.IncludeProperties  ?? Array.Empty<string>();
-        private        int      MaxLen(LogAttribute? a) => a?.MaxContentLength  ?? _options.DefaultMaxContentLength;
+        /// <summary>
+        /// Resolves the effective max depth: attribute-level takes precedence when
+        /// it is non-negative; otherwise falls back to the global default.
+        /// </summary>
+        private int ResolveMaxDepth(LogAttribute? attr)
+            => (attr is not null && attr.MaxDepth >= 0)
+                ? attr.MaxDepth
+                : _options.DefaultMaxDepth;
+
+        private static string[] Excl(LogAttribute? a)  => a?.ExcludeProperties ?? Array.Empty<string>();
+        private static string[] Incl(LogAttribute? a)  => a?.IncludeProperties  ?? Array.Empty<string>();
+        private        int      MaxLen(LogAttribute? a) => a?.MaxContentLength   ?? _options.DefaultMaxContentLength;
     }
 }
