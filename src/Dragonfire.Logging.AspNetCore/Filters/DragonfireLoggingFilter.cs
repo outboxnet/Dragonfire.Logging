@@ -27,6 +27,13 @@ namespace Dragonfire.Logging.AspNetCore.Filters
     {
         private const string CorrelationIdHeader = "X-Correlation-ID";
 
+        /// <summary>
+        /// Key used in <c>HttpContext.Items</c> to publish named properties for downstream
+        /// telemetry enrichers (e.g. DragonfireTelemetryInitializer in the AI package).
+        /// Value: <c>Dictionary&lt;string, object?&gt;</c>
+        /// </summary>
+        public static readonly object NamedPropertiesItemKey = new();
+
         private readonly IDragonfireLoggingService   _loggingService;
         private readonly DragonfireLoggingOptions    _coreOptions;
         private readonly DragonfireAspNetCoreOptions _httpOptions;
@@ -118,6 +125,10 @@ namespace Dragonfire.Logging.AspNetCore.Filters
                         kv => kv.Key,
                         kv => (object)kv.Value!.Errors.Select(e => e.ErrorMessage).ToArray());
             }
+
+            // Make named properties available to telemetry enrichers via HttpContext.Items
+            if (entry.NamedProperties is { Count: > 0 })
+                executed.HttpContext.Items[DragonfireLoggingFilter.NamedPropertiesItemKey] = entry.NamedProperties;
 
             await _loggingService.LogAsync(entry);
             _loggingService.ClearContext(correlationId);
