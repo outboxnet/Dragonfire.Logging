@@ -20,16 +20,6 @@ namespace Dragonfire.Logging.Services
         /// <summary>Persist a fully-built log entry asynchronously.</summary>
         Task LogAsync(LogEntry entry);
 
-        /// <summary>
-        /// Emit an ad-hoc log entry mid-request, enriched with the request's ambient context.
-        /// Useful for business-level checkpoints (e.g. "order validated", "payment authorised").
-        /// </summary>
-        Task LogCustomAsync(string correlationId, string message, object? data = null,
-            LogLevel level = LogLevel.Information);
-
-        /// <summary>Attach an arbitrary key/value pair to the current request's log context.</summary>
-        void AddCustomData(string correlationId, string key, object value);
-
         /// <summary>Get (or lazily create) the ambient context for <paramref name="correlationId"/>.</summary>
         LoggingContext GetOrCreateContext(string correlationId);
 

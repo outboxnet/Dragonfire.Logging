@@ -20,13 +20,17 @@
     <!-- No FrameworkReference — core is ASP.NET-free.
          No Castle.Core / Castle.Core.AsyncInterceptor / Scrutor — decoration uses
          the built-in System.Reflection.DispatchProxy with a hand-rolled Decorate helper. -->
-    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions"            Version="8.0.2" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.2" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="8.0.2" />
-    <PackageReference Include="Newtonsoft.Json"                                       Version="13.0.3" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
   </ItemGroup>
 
   <ItemGroup>
     <None Include="..\..\README.md" Pack="true" PackagePath="\" Condition="Exists('..\..\README.md')" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Folder Include="Interceptors\" />
   </ItemGroup>
 
 </Project>

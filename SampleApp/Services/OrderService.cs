@@ -7,14 +7,7 @@ namespace SampleApp.Services
     {
         public Task<Order> GetOrderAsync(string tenantId, string orderId)
         {
-            throw new ArgumentNullException();
-
-            return Task.FromResult(new Order
-            {
-                TenantId = tenantId,
-                OrderId = orderId,
-                Price = 123
-            });
+            return Task.FromResult<Order>(null);
         }
 
         public void ProcessOrder(string orderId) { 

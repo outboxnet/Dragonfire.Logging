@@ -2,7 +2,6 @@ using System;
 using System.Linq;
 using Dragonfire.Logging.Abstractions;
 using Dragonfire.Logging.Configuration;
-using Dragonfire.Logging.Interceptors;
 using Dragonfire.Logging.Services;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -46,9 +45,6 @@ namespace Dragonfire.Logging.Extensions
             // LogFilterService is stateless — singleton avoids repeated allocation.
             services.TryAddSingleton<ILogFilterService, LogFilterService>();
 
-            if (options.EnableServiceInterception)
-                services.DecorateLoggableServices();
-
             return services;
         }
 
@@ -67,23 +63,6 @@ namespace Dragonfire.Logging.Extensions
         /// </summary>
         public static IServiceCollection DecorateLoggableServices(this IServiceCollection services)
         {
-            var targets = services
-                .Where(d =>
-                    d.ServiceType.IsInterface &&
-                    d.ImplementationType != null &&
-                    typeof(ILoggable).IsAssignableFrom(d.ImplementationType))
-                .Select(d => d.ServiceType)
-                .Distinct()
-                .ToList();
-
-            foreach (var serviceType in targets)
-            {
-                // Uses the hand-rolled Decorate from ServiceDecorationExtensions
-                // (same assembly, internal) — no Scrutor required.
-                services.Decorate(serviceType, (inner, provider) =>
-                    DragonfireProxyFactory.Create(serviceType, inner, provider));
-            }
-
             return services;
         }
 

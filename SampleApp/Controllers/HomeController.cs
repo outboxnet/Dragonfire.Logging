@@ -1,3 +1,4 @@
+using Dragonfire.Logging.Attributes;
 using Microsoft.AspNetCore.Mvc;
 using SampleApp.Models;
 using SampleApp.Services;
@@ -5,6 +6,13 @@ using System.Diagnostics;
 
 namespace SampleApp.Controllers
 {
+    public class OrderResponse
+    {
+        [LogProperty]
+        public string CreatedOrderId { get; set; }
+    }
+
+    [Log]
     public class HomeController : Controller
     {
         private readonly ILogger<HomeController> _logger;
@@ -17,11 +25,14 @@ namespace SampleApp.Controllers
             this.orderService = orderService;
         }
 
-        public async Task<IActionResult> Index()
+        public async Task<IActionResult> Index([FromQuery] string? id)
         {
-            var resuklt = await orderService.GetOrderAsync("123123", "AAAA");
+            var resuklt = await orderService.GetOrderAsync(id, "AAAA");
 
-            return View();
+            return new JsonResult(new OrderResponse
+            {
+                CreatedOrderId = "ASDASD"
+            });
         }
 
         public IActionResult Privacy()

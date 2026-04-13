@@ -24,8 +24,6 @@ namespace Dragonfire.Logging.Models
         public string? UserAgent { get; set; }
         public string? ClientIp { get; set; }
         public Dictionary<string, string>? Headers { get; set; }
-        public object? RequestData { get; set; }
-        public object? ResponseData { get; set; }
         public int? StatusCode { get; set; }
 
         // ── Service layer (populated by DragonfireInterceptor) ────────────────
@@ -40,14 +38,18 @@ namespace Dragonfire.Logging.Models
 
         /// <summary>
         /// Individual structured-log properties promoted from <c>[LogProperty]</c>
-        /// attributes on method parameters and DTO properties. Each entry is emitted
-        /// as its own scope key (no <c>Dragonfire.*</c> prefix) so it appears directly
-        /// in <c>customDimensions</c> and is immediately filterable in KQL:
-        /// <code>| where customDimensions["TenantId"] == "acme"</code>
+        /// attributes. Keys already carry their prefix:
+        /// <list type="bullet">
+        ///   <item><c>Request.{Key}</c> — from action parameters and their DTO types</item>
+        ///   <item><c>Response.{Key}</c> — from response DTO properties</item>
+        /// </list>
+        /// Each entry is emitted as its own scope key and appears directly in
+        /// <c>customDimensions</c>, queryable in KQL without any JSON parsing:
+        /// <code>| where customDimensions["Request.TenantId"] == "acme"</code>
         /// </summary>
         public Dictionary<string, object?>? NamedProperties { get; set; }
 
-        public long ElapsedMilliseconds { get; set; }
+        public double ElapsedMilliseconds { get; set; }
         public bool IsError { get; set; }
         public string? ErrorMessage { get; set; }
         public string? StackTrace { get; set; }

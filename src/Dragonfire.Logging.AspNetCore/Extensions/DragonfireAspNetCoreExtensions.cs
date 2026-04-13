@@ -70,10 +70,6 @@ namespace Dragonfire.Logging.AspNetCore.Extensions
                     mvc.Filters.AddService<DragonfireLoggingFilter>(order: int.MinValue);
             });
 
-            // Middleware: registered in DI so IApplicationBuilder.UseDragonfireLogging()
-            // can activate it for minimal-API pipelines.
-            services.TryAddTransient<DragonfireLoggingMiddleware>();
-
             return services;
         }
 
