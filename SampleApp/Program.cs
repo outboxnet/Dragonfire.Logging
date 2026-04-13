@@ -14,6 +14,20 @@ namespace SampleApp
             // Add services to the container.
             builder.Services.AddControllersWithViews();
 
+            builder.Services.AddDragonfireAspNetCore(
+                core: opt =>
+                {
+                    opt.DefaultMaxDepth = 1;
+                    opt.DefaultMaxContentLength = 10_000;
+                    opt.IncludeStackTraceOnError = true;
+                },
+                http: opt =>
+                {
+                    opt.EnableRequestLogging = true;
+                    opt.EnableResponseLogging = true;
+                    opt.ExcludePaths = new[] { "/health", "/metrics", "/swagger" };
+                });
+
             builder.Services.AddScoped<IOrderService, OrderService>();   // OrderService : ILoggable
 
             builder.Logging.AddJsonConsole(o =>
@@ -22,7 +36,18 @@ namespace SampleApp
                 o.JsonWriterOptions = new System.Text.Json.JsonWriterOptions { Indented = true };
             });
 
-            builder.Services.AddDragonfireGeneratedLogging();
+            //    The configure lambda is optional — omit it to use all defaults.
+            builder.Services.AddDragonfireGeneratedLogging(options =>
+            {
+                options.LogRequestProperties = true;   // include Request.* fields (default: true)
+                options.LogResponseProperties = true;   // include Response.* fields (default: true)
+                options.LogStackTrace = false;  // omit Dragonfire.StackTrace (default: true)
+                options.OverrideLevel = null;   // null = use [Log(Level=...)] per method
+
+                // Suppress specific fields by bare name (matches both Request.X and Response.X)
+                options.ExcludeProperties.Add("InternalId");
+                options.ExcludeProperties.Add("RawPayload");
+            });
 
             var app = builder.Build();
 

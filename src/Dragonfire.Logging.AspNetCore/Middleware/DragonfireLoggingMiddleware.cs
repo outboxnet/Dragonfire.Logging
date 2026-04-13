@@ -86,8 +86,10 @@ namespace Dragonfire.Logging.AspNetCore.Middleware
                     .ReadToEndAsync();
                 context.Request.Body.Position = 0;
 
-                if (!string.IsNullOrEmpty(body))
-                    entry.RequestData = filterService.FilterString(body, _coreOptions.DefaultMaxContentLength);
+                //TODO: minimal API
+                //if (!string.IsNullOrEmpty(body))
+                  //  entry.RequestData = filterService.FilterString(body, _coreOptions.DefaultMaxContentLength);
+            
             }
 
             // ── Execute pipeline ─────────────────────────────────────────────
@@ -131,8 +133,8 @@ namespace Dragonfire.Logging.AspNetCore.Middleware
                     context.Response.Body = originalBody;
 
                     if (!string.IsNullOrEmpty(responseText))
-                        entry.ResponseData = filterService.FilterString(
-                            responseText, _coreOptions.DefaultMaxContentLength);
+                       // entry.ResponseData = filterService.FilterString(
+                         //   responseText, _coreOptions.DefaultMaxContentLength);
 
                     await responseCapture.DisposeAsync();
                 }
