@@ -632,6 +632,7 @@ namespace Dragonfire.Logging.Generator
             sb.AppendLine("            {");
             sb.AppendLine($"                __result = {inner}.{method.Name}({CallArgs(method.Parameters)});");
             EmitResultLogProperties(sb, method, "                ");
+            EmitNullResponseCheck(sb, method, "                ");
             EmitSuccessLog(sb, m, method, "                ");
             sb.AppendLine("            }");
             EmitErrorCatch(sb, m, method, "            ");
@@ -659,6 +660,7 @@ namespace Dragonfire.Logging.Generator
             sb.AppendLine("            {");
             sb.AppendLine($"                __result = await {inner}.{method.Name}({CallArgs(method.Parameters)}).ConfigureAwait(false);");
             EmitResultLogProperties(sb, method, "                ");
+            EmitNullResponseCheck(sb, method, "                ");
             EmitSuccessLog(sb, m, method, "                ");
             sb.AppendLine("            }");
             EmitErrorCatch(sb, m, method, "            ");
@@ -733,6 +735,21 @@ namespace Dragonfire.Logging.Generator
                 sb.AppendLine($"{indent}        __scope[\"Response.{rp.LogKey}\"] = __result.{rp.PropertyName};");
             }
             sb.AppendLine($"{indent}}}");
+        }
+
+        // ── Null response warning ─────────────────────────────────────────────
+        // Emitted only for methods with a [Log] attribute that return a value
+        // (SyncReturn / TaskOfT). The guard is both a compile-time attribute check
+        // (method.LogAttr is not null) and a runtime options flag.
+
+        private static void EmitNullResponseCheck(StringBuilder sb, MethodModel method, string indent)
+        {
+            // Only meaningful on methods that have the [Log] attribute; void/Task never return a value.
+            if (method.LogAttr is null) return;
+
+            sb.AppendLine($"{indent}// Null-response warning — only fires when [Log] is present and options.LogNullResponse = true");
+            sb.AppendLine($"{indent}if (_options.LogNullResponse && __result is null)");
+            sb.AppendLine($"{indent}    __scope[\"Dragonfire.NullResponse\"] = true;");
         }
 
         // ── Log calls — native ILogger.BeginScope + LogXxx ───────────────────
@@ -844,6 +861,8 @@ namespace Dragonfire.Logging.Generator
             sb.AppendLine("            = new global::System.Collections.Generic.HashSet<string>(global::System.StringComparer.OrdinalIgnoreCase);");
             sb.AppendLine("        /// <summary>Override success log level for all methods. null = use [Log(Level=...)] per method.</summary>");
             sb.AppendLine("        public global::Microsoft.Extensions.Logging.LogLevel? OverrideLevel { get; set; }");
+            sb.AppendLine("        /// <summary>Log a warning when a method decorated with [Log] returns null. Default: false.</summary>");
+            sb.AppendLine("        public bool LogNullResponse { get; set; } = false;");
             sb.AppendLine("        internal bool IsExcluded(string bareKey) => ExcludeProperties.Contains(bareKey);");
             sb.AppendLine("    }");
             sb.AppendLine();

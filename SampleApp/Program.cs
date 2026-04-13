@@ -39,6 +39,7 @@ namespace SampleApp
             //    The configure lambda is optional — omit it to use all defaults.
             builder.Services.AddDragonfireGeneratedLogging(options =>
             {
+                options.LogNullResponse = true;
                 options.LogRequestProperties = true;   // include Request.* fields (default: true)
                 options.LogResponseProperties = true;   // include Response.* fields (default: true)
                 options.LogStackTrace = false;  // omit Dragonfire.StackTrace (default: true)
