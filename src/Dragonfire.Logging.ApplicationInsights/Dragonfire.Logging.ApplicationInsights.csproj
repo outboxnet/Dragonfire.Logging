@@ -9,4 +9,9 @@
     <PackageReference Include="Microsoft.ApplicationInsights.AspNetCore" Version="2.22.0" />
     <ProjectReference Include="..\Dragonfire.Logging.AspNetCore\Dragonfire.Logging.AspNetCore.csproj" />
   </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" Condition="Exists('..\..\README.md')" />
+  </ItemGroup>
+
 </Project>
