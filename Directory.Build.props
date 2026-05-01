@@ -1,0 +1,32 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+
+    <!--
+      NuGet package metadata.
+
+      All Dragonfire.* packages are now developed in the consolidated
+      outboxnet/Dragonfire repository. Per-project Authors and RepositoryUrl
+      overrides have been removed so this file is the single source of truth.
+    -->
+    <Authors>Lőrinc Sándor</Authors>
+    <Company>Dragonfire</Company>
+    <Copyright>Copyright (c) Lőrinc Sándor</Copyright>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/outboxnet/Dragonfire</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/outboxnet/Dragonfire.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+
+    <!-- Deterministic builds and SourceLink -->
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+</Project>

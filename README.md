@@ -1,5 +1,7 @@
 # Dragonfire.Logging
 
+> **This package has moved.** The Dragonfire suite is now developed in a single repository: [`outboxnet/Dragonfire`](https://github.com/outboxnet/Dragonfire). Visit it for the latest version and the full suite of packages.
+
 Production-ready, zero-boilerplate **structured logging** for .NET 8+ services and ASP.NET Core APIs.
 
 ```
